@@ -251,12 +251,16 @@ if "P_current" not in st.session_state:
     st.session_state.P_current = P_calc
 
 c1, c2, c3 = st.columns(3)
+
 if c1.button("Reset to calculated P"):
     st.session_state.P_current = P_calc
+
 if c2.button("Use P/2"):
-    st.session_state.P_current = st.session_state.P_current / 2.0
+    st.session_state.P_current = P_calc / 2.0
+
 if c3.button("Use 2P"):
-    st.session_state.P_current = st.session_state.P_current * 2.0
+    st.session_state.P_current = 2.0 * P_calc
+
 
 st.caption(f"Calculated rotation period (P_final_hr): **{P_calc:.6f} h**")
 
@@ -316,3 +320,4 @@ for fname, title in plots:
 
 if not found:
     st.info("No official plot images found yet. Upload images to outputs/objects/<provid>/")
+
