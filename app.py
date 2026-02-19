@@ -87,11 +87,21 @@ display_cols = [
     ] if c in df_f.columns
 ]
 
+# ✅ Safe sorting: only use confidence if it exists
+sort_cols = ["triage_final"]
+ascending = [True]
+if "confidence" in df_f.columns:
+    sort_cols.append("confidence")
+    ascending.append(False)
+
+df_sorted = df_f.sort_values(sort_cols, ascending=ascending)
+
 st.dataframe(
-    df_f.sort_values(["triage_final", "confidence"], ascending=[True, False])[display_cols],
+    df_sorted[display_cols],
     use_container_width=True,
     height=450
 )
+
 
 # ==========================
 # Select Asteroid
@@ -160,3 +170,4 @@ for fname, title in plots:
 
 if not found:
     st.info("No plots found yet. Upload images to outputs/objects/<provid>/")
+
