@@ -155,6 +155,106 @@ key_cols = [
 st.table(row[key_cols])
 
 # ==========================
+# Photometry Section
+# ==========================
+st.subheader("Photometry Explorer")
+
+PHOTO_FILE = "bq-results.csv"  # must exist in repo OR load from URL
+
+@st.cache_data(show_spinner=False)
+def load_photometry():
+    return pd.read_csv(PHOTO_FILE)
+
+try:
+    df_photo = load_photometry()
+except Exception as e:
+    st.warning("Photometry file not found yet.")
+    st.stop()
+
+# Filter to selected asteroid
+df_obj = df_photo[df_photo["provid"].astype(str) == selected].copy()
+
+if len(df_obj) == 0:
+    st.warning("No photometry rows for this asteroid.")
+    st.stop()
+
+# Convert time
+df_obj["obstime"] = pd.to_datetime(df_obj["obstime"], errors="coerce")
+df_obj = df_obj.dropna(subset=["obstime", "mag"])
+
+# Sidebar controls
+st.sidebar.header("Photometry Controls")
+
+bands = sorted(df_obj["band"].unique())
+sel_bands = st.sidebar.multiselect("Bands", bands, default=bands)
+
+max_rms = st.sidebar.slider(
+    "Max rmsmag",
+    float(df_obj["rmsmag"].min()),
+    float(df_obj["rmsmag"].max()),
+    float(df_obj["rmsmag"].quantile(0.9))
+)
+
+df_plot = df_obj[
+    (df_obj["band"].isin(sel_bands)) &
+    (df_obj["rmsmag"] <= max_rms)
+].copy()
+
+# ------------------
+# Raw Lightcurve
+# ------------------
+st.markdown("### Raw Lightcurve")
+
+import matplotlib.pyplot as plt
+
+fig, ax = plt.subplots()
+
+for b in sel_bands:
+    d = df_plot[df_plot["band"] == b]
+    ax.scatter(d["obstime"], d["mag"], s=8, label=b)
+
+ax.invert_yaxis()
+ax.set_xlabel("Time")
+ax.set_ylabel("Magnitude")
+ax.legend()
+
+st.pyplot(fig)
+
+# ------------------
+# Folding Section
+# ------------------
+st.markdown("### Folded Lightcurve")
+
+default_period = float(row["P_final_hr"])
+
+P = st.slider(
+    "Fold period (hours)",
+    min_value=float(default_period * 0.5),
+    max_value=float(default_period * 2.0),
+    value=float(default_period),
+    step=float(default_period * 0.001)
+)
+
+# Convert time to hours relative
+t0 = df_plot["obstime"].min()
+t_hr = (df_plot["obstime"] - t0).dt.total_seconds() / 3600.0
+phase = (t_hr / P) % 1.0
+
+fig2, ax2 = plt.subplots()
+
+for b in sel_bands:
+    m = df_plot["band"] == b
+    ax2.scatter(phase[m], df_plot["mag"][m], s=8, label=b)
+    ax2.scatter(phase[m] + 1.0, df_plot["mag"][m], s=8)
+
+ax2.invert_yaxis()
+ax2.set_xlabel("Phase")
+ax2.set_ylabel("Magnitude")
+ax2.legend()
+
+st.pyplot(fig2)
+
+# ==========================
 # Diagnostic Plots
 # ==========================
 st.subheader("Diagnostic Plots")
@@ -176,6 +276,7 @@ for fname, title in plots:
 
 if not found:
     st.info("No plots found yet. Upload images to outputs/objects/<provid>/")
+
 
 
 
