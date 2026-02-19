@@ -21,13 +21,13 @@ def load_overrides():
     if os.path.exists(OVERRIDES_FILE):
         return pd.read_csv(OVERRIDES_FILE)
     return pd.DataFrame(columns=["provid", "triage_manual", "P_manual_hr", "notes"])
-
-st.download_button(
+    st.download_button(
     "Download current scoreboard (CSV)",
     data=df_sorted[display_cols].to_csv(index=False).encode("utf-8"),
     file_name="scoreboard_filtered.csv",
     mime="text/csv",
 )
+
 
 try:
     df = load_master()
@@ -177,5 +177,6 @@ for fname, title in plots:
 
 if not found:
     st.info("No plots found yet. Upload images to outputs/objects/<provid>/")
+
 
 
