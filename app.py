@@ -203,37 +203,39 @@ df_plot = df_obj[
 # ------------------
 # Raw Lightcurve
 # ------------------
-st.markdown("### Raw Lightcurve")
-
-import matplotlib.pyplot as plt
-
-fig, ax = plt.subplots()
-
-for b in sel_bands:
-    d = df_plot[df_plot["band"] == b]
-    ax.scatter(d["obstime"], d["mag"], s=8, label=b)
-
-ax.invert_yaxis()
-ax.set_xlabel("Time")
-ax.set_ylabel("Magnitude")
-ax.legend()
-
-st.pyplot(fig)
-
-# ------------------
-# Folding Section
-# ------------------
 st.markdown("### Folded Lightcurve")
 
-default_period = float(row["P_final_hr"])
+P_calc = float(row["P_final_hr"])   # your calculated/adopted period (hours)
 
+# --- quick controls ---
+c1, c2, c3 = st.columns(3)
+
+# store the current period in session_state so buttons can change it
+if "P_current" not in st.session_state:
+    st.session_state.P_current = P_calc
+
+if c1.button("Reset to calculated P"):
+    st.session_state.P_current = P_calc
+
+if c2.button("Use P/2"):
+    st.session_state.P_current = st.session_state.P_current / 2.0
+
+if c3.button("Use 2P"):
+    st.session_state.P_current = st.session_state.P_current * 2.0
+
+st.caption(f"Calculated rotation period (P_final_hr): **{P_calc:.6f} h**")
+
+# --- slider bound around calculated period ---
 P = st.slider(
     "Fold period (hours)",
-    min_value=float(default_period * 0.5),
-    max_value=float(default_period * 2.0),
-    value=float(default_period),
-    step=float(default_period * 0.001)
+    min_value=float(P_calc * 0.25),
+    max_value=float(P_calc * 4.0),
+    value=float(st.session_state.P_current),
+    step=float(max(P_calc * 0.001, 1e-4)),
 )
+
+# keep session state synced with slider moves
+st.session_state.P_current = P
 
 # Convert time to hours relative
 t0 = df_plot["obstime"].min()
@@ -276,6 +278,7 @@ for fname, title in plots:
 
 if not found:
     st.info("No plots found yet. Upload images to outputs/objects/<provid>/")
+
 
 
 
