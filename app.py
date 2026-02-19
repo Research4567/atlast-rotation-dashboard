@@ -12,12 +12,12 @@ st.title("ATLAST Asteroid Rotation Dashboard")
 # ==========================
 @st.cache_data
 def load_master():
-    return pd.read_csv("master_results.csv")
+    return pd.read_csv("master_results_clean.csv")
 
 try:
     df = load_master()
 except Exception as e:
-    st.error(f"Could not load master_results.csv: {e}")
+    st.error(f"Could not load master_results_clean.csv: {e}")
     st.stop()
 
 # ==========================
@@ -110,5 +110,6 @@ st.markdown("---")
 st.subheader("What's New")
 
 new_reliable = df[df["triage_class"] == "reliable"]
+
 
 st.write(f"Total reliable periods: {len(new_reliable)}")
