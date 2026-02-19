@@ -11,7 +11,7 @@ st.title("ATLAST Asteroid Rotation Dashboard")
 
 MASTER_FILE = "master_results_clean.csv"
 OVERRIDES_FILE = "overrides.csv"
-PHOTO_FILE = "bq-results.csv"  # you uploaded this to the repo (18 MB)
+PHOTO_FILE = "bq-results.csv"  # in repo
 
 # ==========================
 # Load Data
@@ -89,9 +89,9 @@ if "confidence" in df_f.columns:
     sort_cols.append("confidence")
     ascending.append(False)
 
-df_sorted = df_f.sort_values(sort_cols, ascending=ascending)
+df_sorted = df_f.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
 
-st.dataframe(df_sorted[display_cols], use_container_width=True, height=420)
+st.dataframe(df_sorted[display_cols], use_container_width=True, height=380)
 
 st.download_button(
     "Download current scoreboard (CSV)",
@@ -101,16 +101,48 @@ st.download_button(
 )
 
 # ==========================
-# Select Asteroid
+# View buttons (row-click alternative)
+# ==========================
+st.markdown("### Quick view (click a button to load that asteroid)")
+
+# Initialize selection state
+if "selected_asteroid" not in st.session_state:
+    if len(df_sorted):
+        st.session_state["selected_asteroid"] = str(df_sorted.loc[0, "provid"])
+    else:
+        st.session_state["selected_asteroid"] = None
+
+# Show buttons for top N rows to avoid rendering too many buttons
+MAX_BUTTONS = 30
+btn_rows = df_sorted.head(MAX_BUTTONS)
+
+btn_cols = st.columns(3)
+for i, provid in enumerate(btn_rows["provid"].astype(str).tolist()):
+    with btn_cols[i % 3]:
+        if st.button(f"View {provid}", use_container_width=True):
+            st.session_state["selected_asteroid"] = provid
+            st.rerun()
+
+# ==========================
+# Sidebar asteroid selector (synced)
 # ==========================
 st.sidebar.header("Asteroid")
-asteroids = df_sorted["provid"].astype(str).tolist()
+asteroid_list = df_sorted["provid"].astype(str).tolist()
 
-if len(asteroids) == 0:
+if len(asteroid_list) == 0:
     st.warning("No asteroids match filters.")
     st.stop()
 
-selected = st.sidebar.selectbox("Choose asteroid", asteroids)
+# Keep sidebar selectbox synced to state
+try:
+    default_index = asteroid_list.index(st.session_state["selected_asteroid"])
+except Exception:
+    default_index = 0
+    st.session_state["selected_asteroid"] = asteroid_list[0]
+
+selected = st.sidebar.selectbox("Choose asteroid", asteroid_list, index=default_index)
+st.session_state["selected_asteroid"] = selected
+
 row = df[df["provid"].astype(str) == str(selected)].iloc[0]
 
 st.header(selected)
@@ -150,7 +182,6 @@ if missing:
     st.error(f"Photometry file missing columns: {missing}")
     st.stop()
 
-# Filter to selected asteroid
 df_obj = df_photo[df_photo["provid"].astype(str) == str(selected)].copy()
 if len(df_obj) == 0:
     st.warning("No photometry rows for this asteroid.")
@@ -164,7 +195,7 @@ df_obj["band"] = df_obj["band"].astype(str)
 df_obj = df_obj.dropna(subset=["obstime", "mag", "rmsmag", "band"])
 df_obj = df_obj.sort_values("obstime")
 
-# Sidebar controls for photometry
+# Sidebar controls
 st.sidebar.header("Photometry Controls")
 bands = sorted(df_obj["band"].unique().tolist())
 sel_bands = st.sidebar.multiselect("Bands", bands, default=bands)
@@ -175,45 +206,29 @@ rms_default = float(df_obj["rmsmag"].quantile(0.90))
 max_rms = st.sidebar.slider("Max rmsmag", rms_min, rms_max, rms_default)
 
 df_plot = df_obj[(df_obj["band"].isin(sel_bands)) & (df_obj["rmsmag"] <= max_rms)].copy()
-
 if len(df_plot) < 10:
     st.warning("Too few photometry points after filters. Increase max rmsmag or select more bands.")
     st.stop()
 
-# ------------------
-# Raw Lightcurve
-# ------------------
+# Raw lightcurve
 st.markdown("### Raw Lightcurve (time domain)")
-
 fig_raw, ax_raw = plt.subplots()
 for b in sel_bands:
     d = df_plot[df_plot["band"] == b]
     ax_raw.scatter(d["obstime"], d["mag"], s=10, label=b)
-
 ax_raw.invert_yaxis()
 ax_raw.set_xlabel("Time")
 ax_raw.set_ylabel("Magnitude")
 ax_raw.legend()
 st.pyplot(fig_raw, clear_figure=True)
 
-# ------------------
 # Fold quality metric
-# ------------------
 def fold_quality_score(t_hr: np.ndarray, mag: np.ndarray, P_hr: float, nbins: int = 30) -> float:
-    """
-    Simple fold quality metric:
-    - compute phase
-    - bin phases
-    - within-bin robust scatter (MAD)
-    - return 0–100 score where higher is better
-    """
     if not np.isfinite(P_hr) or P_hr <= 0:
         return np.nan
-
     phase = (t_hr / P_hr) % 1.0
     bins = np.linspace(0, 1, nbins + 1)
     scatters = []
-
     for i in range(nbins):
         m = (phase >= bins[i]) & (phase < bins[i + 1])
         if m.sum() < 5:
@@ -221,24 +236,18 @@ def fold_quality_score(t_hr: np.ndarray, mag: np.ndarray, P_hr: float, nbins: in
         y = mag[m]
         med = np.nanmedian(y)
         mad = np.nanmedian(np.abs(y - med))
-        scatters.append(1.4826 * mad)  # approx sigma
-
+        scatters.append(1.4826 * mad)
     if len(scatters) < 5:
         return np.nan
-
     s = float(np.nanmedian(scatters))
-    # Convert scatter to a score: smaller scatter => higher score
-    # Scale relative to overall mag scatter:
     base = float(np.nanstd(mag))
     if not np.isfinite(base) or base <= 0:
         base = 0.1
     ratio = s / base
-    score = 100 * max(0.0, 1.0 - ratio)  # ratio=0 => 100, ratio>=1 => 0
+    score = 100 * max(0.0, 1.0 - ratio)
     return float(np.clip(score, 0, 100))
 
-# ------------------
-# Folded Lightcurve controls
-# ------------------
+# Folded lightcurve controls
 st.markdown("### Folded Lightcurve (phase domain)")
 
 P_calc = float(row["P_final_hr"]) if "P_final_hr" in row.index and pd.notna(row["P_final_hr"]) else np.nan
@@ -246,46 +255,39 @@ if not np.isfinite(P_calc) or P_calc <= 0:
     st.warning("No valid P_final_hr for this asteroid.")
     st.stop()
 
-# session state to support buttons
-if "P_current" not in st.session_state:
-    st.session_state.P_current = P_calc
+# session state (per asteroid)
+state_key = f"P_current__{selected}"
+if state_key not in st.session_state:
+    st.session_state[state_key] = P_calc
 
 c1, c2, c3 = st.columns(3)
-
 if c1.button("Reset to calculated P"):
-    st.session_state.P_current = P_calc
-
+    st.session_state[state_key] = P_calc
 if c2.button("Use P/2"):
-    st.session_state.P_current = P_calc / 2.0
-
+    st.session_state[state_key] = P_calc / 2.0
 if c3.button("Use 2P"):
-    st.session_state.P_current = 2.0 * P_calc
-
+    st.session_state[state_key] = 2.0 * P_calc
 
 st.caption(f"Calculated rotation period (P_final_hr): **{P_calc:.6f} h**")
 
 P = st.slider(
     "Fold period (hours)",
-    min_value=float(P_calc * 0.25),
-    max_value=float(P_calc * 4.0),
-    value=float(st.session_state.P_current),
+    min_value=float(P_calc * 0.5),
+    max_value=float(P_calc * 2.0),
+    value=float(st.session_state[state_key]),
     step=float(max(P_calc * 0.001, 1e-4)),
 )
-st.session_state.P_current = P
+st.session_state[state_key] = P
 
-# Fold
 t0 = df_plot["obstime"].min()
 t_hr = (df_plot["obstime"] - t0).dt.total_seconds().to_numpy() / 3600.0
 
-# Detrend per band (helps folding)
 df_fold = df_plot.copy()
 df_fold["mag_detrend"] = df_fold["mag"] - df_fold.groupby("band")["mag"].transform("median")
-
 phase = (t_hr / P) % 1.0
 
-# fold-quality
 score = fold_quality_score(t_hr, df_fold["mag_detrend"].to_numpy(), P, nbins=30)
-st.metric("Fold Quality Score (0–100, higher is better)", f"{score:.1f}" if np.isfinite(score) else "n/a")
+st.metric("Fold Quality Score (0–100)", f"{score:.1f}" if np.isfinite(score) else "n/a")
 
 fig_fold, ax_fold = plt.subplots()
 for b in sel_bands:
@@ -320,4 +322,3 @@ for fname, title in plots:
 
 if not found:
     st.info("No official plot images found yet. Upload images to outputs/objects/<provid>/")
-
