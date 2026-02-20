@@ -64,11 +64,9 @@ def _safe_num(x):
     return pd.to_numeric(x, errors="coerce")
 
 def _norm_provid(p: str) -> str:
-    # keep consistent naming for folder lookups
     return _as_str(p).strip()
 
 def _obj_dir(provid: str) -> Path:
-    # NOTE: you can adjust this mapping to match your repo structure
     return OBJECTS_DIR / _norm_provid(provid).replace(" ", "_")
 
 def _read_csv_if_exists(path: Path):
@@ -156,13 +154,35 @@ df_f = df[df["triage_final"].astype(str).isin(selected_triage)].copy()
 if top_only and "confidence" in df_f.columns:
     df_f = df_f[_safe_num(df_f["confidence"]) >= 80].copy()
 
+# ----------------------------------------------------
+# IMPORTANT: Build df_sorted HERE (before sidebar select)
+# ----------------------------------------------------
+display_cols = [
+    c for c in [
+        "provid", "triage_final", "confidence",
+        "P_final_hr", "sigma_sec",
+        "N_obs", "arc_days",
+        "bootstrap_top_frac", "bootstrap_n_unique",
+        "g_r", "g_i", "r_i",
+        "run_id_utc", "pipeline_version"
+    ] if c in df_f.columns
+]
 
+sort_cols = ["triage_final"]
+ascending = [True]
+if "confidence" in df_f.columns:
+    sort_cols.append("confidence")
+    ascending.append(False)
+
+# If df_f is empty, avoid errors
+df_sorted = df_f.sort_values(sort_cols, ascending=ascending).reset_index(drop=True) if len(df_f) else df_f.copy()
 
 # --------------------------
 # Sidebar asteroid selector
 # --------------------------
 st.sidebar.header("Asteroid")
-asteroid_list = df_sorted["provid"].astype(str).tolist()
+
+asteroid_list = df_sorted["provid"].astype(str).tolist() if "provid" in df_sorted.columns else []
 
 if len(asteroid_list) == 0:
     st.warning("No asteroids match filters.")
@@ -171,7 +191,6 @@ if len(asteroid_list) == 0:
 if "selected_asteroid" not in st.session_state:
     st.session_state["selected_asteroid"] = asteroid_list[0]
 
-# keep selection valid if filters change
 if st.session_state["selected_asteroid"] not in asteroid_list:
     st.session_state["selected_asteroid"] = asteroid_list[0]
 
@@ -212,7 +231,6 @@ with tab_key:
     else:
         st.info("No key columns found in master file for this object.")
 
-    # Quick adopted-vs-2P evidence if present
     extra_cols = [c for c in ["2P candidate (hr)", "ΔBIC(2P−P)", "LS peak period (hr)"] if c in df.columns]
     if extra_cols:
         st.caption("Extra period-evidence fields (if present in master CSV)")
@@ -252,7 +270,6 @@ with tab_photo:
 
     df_obj = df_obj.dropna(subset=["obstime", "mag", "rmsmag", "band"]).sort_values("obstime")
 
-    # Controls
     st.sidebar.header("Photometry Controls")
     bands = sorted(df_obj["band"].unique().tolist())
     sel_bands = st.sidebar.multiselect("Bands", bands, default=bands)
@@ -267,14 +284,11 @@ with tab_photo:
         st.warning("Too few photometry points after filters. Increase max rmsmag or select more bands.")
         st.stop()
 
-    # time array (hours since first obs)
     t0 = df_plot["obstime"].min()
     t_hr = (df_plot["obstime"] - t0).dt.total_seconds().to_numpy() / 3600.0
 
-    # detrend per band for exploratory viewing (not your official pipeline reduction)
     df_plot["mag_detrend"] = df_plot["mag"] - df_plot.groupby("band")["mag"].transform("median")
 
-    # Raw LC
     st.markdown("### Raw Lightcurve (time domain)")
     fig_raw, ax_raw = plt.subplots()
     for b in sel_bands:
@@ -286,7 +300,6 @@ with tab_photo:
     ax_raw.legend()
     st.pyplot(fig_raw, clear_figure=True)
 
-    # Adopted period
     P_calc = float(row["P_final_hr"]) if "P_final_hr" in row.index and pd.notna(row["P_final_hr"]) else np.nan
     if not np.isfinite(P_calc) or P_calc <= 0:
         st.warning("No valid P_final_hr for this asteroid.")
@@ -294,9 +307,6 @@ with tab_photo:
 
     st.caption(f"Pipeline adopted period (P_final_hr): **{P_calc:.6f} h**")
 
-    # --------------------------
-    # Quick validation (Simple + Research)
-    # --------------------------
     st.markdown("## Quick validation")
 
     def plot_fold(ax, t_hr_arr, mag_arr, bands_arr, P_hr, title):
@@ -322,18 +332,10 @@ with tab_photo:
     for col, P_hr, title in zip(cols, periods, titles):
         with col:
             fig, ax = plt.subplots()
-            plot_fold(
-                ax,
-                t_hr_arr=t_hr_arr,
-                mag_arr=mag_arr,
-                bands_arr=bands_arr,
-                P_hr=float(P_hr),
-                title=title
-            )
+            plot_fold(ax, t_hr_arr, mag_arr, bands_arr, float(P_hr), title)
             ax.legend(fontsize=7)
             st.pyplot(fig, clear_figure=True)
 
-    # Load bootstrap winners if present (optional) for alias lines + research histogram
     boot_path = _obj_dir(selected) / "step12_bootstrap_winner_fractions.csv"
     df_boot_quick = _read_csv_if_exists(boot_path)
 
@@ -343,14 +345,11 @@ with tab_photo:
         tmp["P_hr"] = pd.to_numeric(tmp["P_hr"], errors="coerce")
         tmp["frac"] = pd.to_numeric(tmp["frac"], errors="coerce")
         tmp = tmp.dropna(subset=["P_hr", "frac"]).sort_values("frac", ascending=False)
-
-        # take top 3 aliases excluding ~P itself
         for p in tmp["P_hr"].head(6).to_numpy(float):
             if np.isfinite(p) and abs(p - P_calc) / P_calc > 0.002:
                 alias_periods.append(float(p))
         alias_periods = alias_periods[:3]
 
-    # Periodogram (exploratory)
     st.markdown("### Periodogram (exploratory Lomb–Scargle)")
     if not HAS_ASTROPY:
         st.info("Install astropy to enable Lomb–Scargle periodogram (pip install astropy).")
@@ -388,13 +387,9 @@ with tab_photo:
         ax_pg.legend(fontsize=8)
         st.pyplot(fig_pg, clear_figure=True)
 
-    # --------------------------
-    # Research diagnostics
-    # --------------------------
     if is_research:
         st.markdown("## Research diagnostics")
 
-        # Fold-quality metric + interactive period slider (research only)
         def fold_quality_score(t_hr_in: np.ndarray, mag_in: np.ndarray, P_hr: float, nbins: int = 30) -> float:
             if not np.isfinite(P_hr) or P_hr <= 0:
                 return np.nan
@@ -419,55 +414,6 @@ with tab_photo:
             score = 100 * max(0.0, 1.0 - ratio)
             return float(np.clip(score, 0, 100))
 
-        st.markdown("### Interactive fold period (exploration)")
-
-        state_key = f"P_current__{selected}"
-        base_key = f"P_base__{selected}"
-
-        if base_key not in st.session_state:
-            st.session_state[base_key] = P_calc
-        else:
-            # keep base synced to current object’s official P
-            st.session_state[base_key] = P_calc
-
-        if state_key not in st.session_state:
-            st.session_state[state_key] = P_calc
-
-        c1, c2, c3 = st.columns(3)
-        if c1.button("Reset to P_final", key=f"reset_{selected}"):
-            st.session_state[state_key] = st.session_state[base_key]
-        if c2.button("Use P/2 (of P_final)", key=f"half_{selected}"):
-            st.session_state[state_key] = 0.5 * st.session_state[base_key]
-        if c3.button("Use 2P (of P_final)", key=f"double_{selected}"):
-            st.session_state[state_key] = 2.0 * st.session_state[base_key]
-
-        P = st.slider(
-            "Fold period (hours)",
-            min_value=float(P_calc * 0.5),
-            max_value=float(P_calc * 2.0),
-            value=float(st.session_state[state_key]),
-            step=float(max(P_calc * 0.001, 1e-4)),
-            key=f"fold_slider_{selected}",
-        )
-        st.session_state[state_key] = float(P)
-
-        phase = (t_hr_arr / float(P)) % 1.0
-        score = fold_quality_score(t_hr_arr, mag_arr, float(P), nbins=30)
-        st.metric("Fold Quality Score (0–100)", f"{score:.1f}" if np.isfinite(score) else "n/a")
-
-        fig_fold, ax_fold = plt.subplots()
-        for b in sorted(np.unique(bands_arr)):
-            m = (bands_arr == b)
-            ax_fold.scatter(phase[m], mag_arr[m], s=10, label=b)
-            ax_fold.scatter(phase[m] + 1.0, mag_arr[m], s=10)
-        ax_fold.invert_yaxis()
-        ax_fold.set_xlabel("Phase")
-        ax_fold.set_ylabel("Detrended mag (mag - median per band)")
-        ax_fold.set_title(f"Folded lightcurve at P = {float(P):.6f} h")
-        ax_fold.legend()
-        st.pyplot(fig_fold, clear_figure=True)
-
-        # Interactive bootstrap histogram
         st.markdown("### Bootstrap winner distribution")
         if df_boot_quick is not None and {"P_hr", "wins", "frac"}.issubset(df_boot_quick.columns):
             tmp = df_boot_quick.copy()
@@ -476,7 +422,6 @@ with tab_photo:
             tmp["frac"] = pd.to_numeric(tmp["frac"], errors="coerce")
             tmp = tmp.dropna(subset=["P_hr", "wins"]).sort_values("P_hr")
 
-            # Expand wins into samples for a true histogram (OK for N_BOOT~400)
             wins_int = tmp["wins"].fillna(0).astype(int).to_numpy()
             samples = np.repeat(tmp["P_hr"].to_numpy(float), wins_int)
 
@@ -533,7 +478,7 @@ with tab_pipeline:
         st.markdown("### Official tables (CSV if present)")
 
         candidates_csv = obj_dir / "step11_fourier_validator.csv"
-        fam_csv = obj_dir / "step11_families.csv"                 # optional
+        fam_csv = obj_dir / "step11_families.csv"
         boot_winners_csv = obj_dir / "step12_bootstrap_winner_fractions.csv"
         step13_summary_csv = obj_dir / "step13_final_summary.csv"
 
@@ -596,28 +541,9 @@ with tab_pipeline:
         st.info("Switch to **Research** mode to view official tables & downloads in this tab.")
 
 # --------------------------
-# Scoreboard
+# Scoreboard (DISPLAY ONLY) - can be at bottom
 # --------------------------
 st.subheader("Scoreboard")
-
-display_cols = [
-    c for c in [
-        "provid", "triage_final", "confidence",
-        "P_final_hr", "sigma_sec",
-        "N_obs", "arc_days",
-        "bootstrap_top_frac", "bootstrap_n_unique",
-        "g_r", "g_i", "r_i",
-        "run_id_utc", "pipeline_version"
-    ] if c in df_f.columns
-]
-
-sort_cols = ["triage_final"]
-ascending = [True]
-if "confidence" in df_f.columns:
-    sort_cols.append("confidence")
-    ascending.append(False)
-
-df_sorted = df_f.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
 
 st.dataframe(df_sorted[display_cols], use_container_width=True, height=380)
 
