@@ -18,6 +18,27 @@ except Exception:
 # --------------------------
 st.set_page_config(page_title="ATLAST Rotation Dashboard", layout="wide")
 
+
+st.markdown(
+    """
+    <style>
+      /* Sticky header container */
+      .sticky-header {
+        position: sticky;
+        top: 0;
+        z-index: 999;
+        background: var(--background-color);
+        padding-top: 0.25rem;
+        padding-bottom: 0.25rem;
+        border-bottom: 1px solid rgba(49, 51, 63, 0.2);
+      }
+      /* Reduce extra top padding Streamlit adds */
+      div.block-container { padding-top: 1rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # --- Mode toggle (header row) ---
 h1, h2 = st.columns([0.75, 0.25])
 with h1:
@@ -553,3 +574,4 @@ st.download_button(
     file_name="scoreboard_filtered.csv",
     mime="text/csv",
 )
+
