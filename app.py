@@ -156,38 +156,7 @@ df_f = df[df["triage_final"].astype(str).isin(selected_triage)].copy()
 if top_only and "confidence" in df_f.columns:
     df_f = df_f[_safe_num(df_f["confidence"]) >= 80].copy()
 
-# --------------------------
-# Scoreboard
-# --------------------------
-st.subheader("Scoreboard")
 
-display_cols = [
-    c for c in [
-        "provid", "triage_final", "confidence",
-        "P_final_hr", "sigma_sec",
-        "N_obs", "arc_days",
-        "bootstrap_top_frac", "bootstrap_n_unique",
-        "g_r", "g_i", "r_i",
-        "run_id_utc", "pipeline_version"
-    ] if c in df_f.columns
-]
-
-sort_cols = ["triage_final"]
-ascending = [True]
-if "confidence" in df_f.columns:
-    sort_cols.append("confidence")
-    ascending.append(False)
-
-df_sorted = df_f.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
-
-st.dataframe(df_sorted[display_cols], use_container_width=True, height=380)
-
-st.download_button(
-    "Download current scoreboard (CSV)",
-    data=df_sorted[display_cols].to_csv(index=False).encode("utf-8"),
-    file_name="scoreboard_filtered.csv",
-    mime="text/csv",
-)
 
 # --------------------------
 # Sidebar asteroid selector
@@ -625,3 +594,36 @@ with tab_pipeline:
                 st.info("No step11_families.csv found (optional). If you want it, write fam_df to CSV in Step 11.")
     else:
         st.info("Switch to **Research** mode to view official tables & downloads in this tab.")
+
+# --------------------------
+# Scoreboard
+# --------------------------
+st.subheader("Scoreboard")
+
+display_cols = [
+    c for c in [
+        "provid", "triage_final", "confidence",
+        "P_final_hr", "sigma_sec",
+        "N_obs", "arc_days",
+        "bootstrap_top_frac", "bootstrap_n_unique",
+        "g_r", "g_i", "r_i",
+        "run_id_utc", "pipeline_version"
+    ] if c in df_f.columns
+]
+
+sort_cols = ["triage_final"]
+ascending = [True]
+if "confidence" in df_f.columns:
+    sort_cols.append("confidence")
+    ascending.append(False)
+
+df_sorted = df_f.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+
+st.dataframe(df_sorted[display_cols], use_container_width=True, height=380)
+
+st.download_button(
+    "Download current scoreboard (CSV)",
+    data=df_sorted[display_cols].to_csv(index=False).encode("utf-8"),
+    file_name="scoreboard_filtered.csv",
+    mime="text/csv",
+)
