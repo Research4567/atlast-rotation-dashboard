@@ -100,28 +100,6 @@ st.download_button(
     mime="text/csv",
 )
 
-# ==========================
-# View buttons (row-click alternative)
-# ==========================
-st.markdown("### Quick view (click a button to load that asteroid)")
-
-# Initialize selection state
-if "selected_asteroid" not in st.session_state:
-    if len(df_sorted):
-        st.session_state["selected_asteroid"] = str(df_sorted.loc[0, "provid"])
-    else:
-        st.session_state["selected_asteroid"] = None
-
-# Show buttons for top N rows to avoid rendering too many buttons
-MAX_BUTTONS = 30
-btn_rows = df_sorted.head(MAX_BUTTONS)
-
-btn_cols = st.columns(3)
-for i, provid in enumerate(btn_rows["provid"].astype(str).tolist()):
-    with btn_cols[i % 3]:
-        if st.button(f"View {provid}", use_container_width=True):
-            st.session_state["selected_asteroid"] = provid
-            st.rerun()
 
 # ==========================
 # Sidebar asteroid selector (synced)
@@ -322,3 +300,4 @@ for fname, title in plots:
 
 if not found:
     st.info("No official plot images found yet. Upload images to outputs/objects/<provid>/")
+
