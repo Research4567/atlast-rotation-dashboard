@@ -1,12 +1,15 @@
 # app.py
 # ==========================================================
 # ATLAST Rotation Dashboard (Master-powered + Raw fold caveat)
-# - Tabs reordered: Photometry -> Characterisation -> Population
-# - Removed Simple/Research toggle (since no behavioral difference)
-# - Sidebar reorganized:
-#     * Top: object selection + object-only controls (fold period explore)
-#     * Bottom: population filters (period range + N_obs range + reliability)
-# - Photometry tab is first (default) as requested
+# FIXES / UPGRADES:
+# - Sidebar "Object" -> "Asteroid"
+# - Photometry tab header shows: "Raw fold preview: <asteroid> (reliable/ambiguous/insufficient)"
+# - Fold controls order: Fold period slider ABOVE ±% slider
+# - "Reset to adopted" button restores default fold period + default ±% range
+# - Population tab no longer “blank” when Reliability multiselect is empty:
+#     * Empty selection is treated as “all reliabilities”
+#     * If filters still yield 0 objects, shows a clear warning + skips plots cleanly
+# - Raw photometry matching improved via normalization (spaces/underscores/case)
 # ==========================================================
 
 from __future__ import annotations
@@ -70,6 +73,20 @@ def reliability_badge(rel: str) -> str:
     if r == "insufficient":
         return "❌ insufficient"
     return "—"
+
+def reliability_short(rel: str) -> str:
+    r = (rel or "").strip().lower()
+    return r if r in {"reliable", "ambiguous", "insufficient"} else "unknown"
+
+def norm_id(x) -> str:
+    """Normalize IDs for matching across files (spaces/underscores/case differences)."""
+    if x is None:
+        return ""
+    s = str(x).strip().lower()
+    # collapse common separators
+    for ch in [" ", "_", "-", "\t", "\n", "\r"]:
+        s = s.replace(ch, "")
+    return s
 
 def resolve_time_hours(df: pd.DataFrame) -> tuple[pd.Series, str]:
     # 1) Already-hours candidates
@@ -145,24 +162,31 @@ for c in NUM_COLS:
     if c in master.columns:
         master[c] = safe_num(master[c])
 
+# Default slider settings
+DEFAULT_PCT = 5.0
+
+# Persist UI state
+if "fold_pct" not in st.session_state:
+    st.session_state.fold_pct = DEFAULT_PCT
+if "fold_period" not in st.session_state:
+    st.session_state.fold_period = None  # set after we know adopted P
+
 # -------------------------
 # Header
 # -------------------------
 st.title("ATLAST Asteroid Rotation Dashboard")
 st.caption(
-    "Photometry tab shows a raw fold preview from Rubin First Look photometry (no geometric corrections yet). "
+    "Photometry shows a raw fold preview from Rubin First Look photometry (no geometric corrections yet). "
     "Characterisation + Population are master-file driven."
 )
 
 # -------------------------
-# Sidebar: OBJECT selection first (object controls)
+# Sidebar: ASTEROID selection + fold controls
 # -------------------------
-st.sidebar.header("Object")
+st.sidebar.header("Asteroid")
 
-# Reliability is a population filter, but also helps selecting objects; keep available below in Population section.
-q = st.sidebar.text_input("Search designation contains", value="", placeholder="e.g., 2025 MB17")
+q = st.sidebar.text_input("Search designation contains", value="", placeholder="e.g., 2025 MB36")
 
-# Start with a lightweight search list for selection (no population sliders yet)
 df_pick = master.copy()
 if q.strip():
     df_pick = df_pick[df_pick["Designation"].astype(str).str.contains(q.strip(), case=False, na=False)]
@@ -170,26 +194,69 @@ df_pick = df_pick.sort_values("Designation")
 
 designations = df_pick["Designation"].astype(str).tolist()
 if not designations:
-    st.warning("No objects match your search.")
+    st.warning("No asteroids match your search.")
     st.stop()
 
-selected = st.sidebar.selectbox("Selected object", options=designations, index=0)
+selected = st.sidebar.selectbox("Selected asteroid", options=designations, index=0)
 
 row = master[master["Designation"].astype(str) == str(selected)]
 row = row.iloc[0].to_dict() if len(row) else {}
 
 P_adopt = float(row.get("Adopted period (hr)", np.nan))
-P_calc = P_adopt if (np.isfinite(P_adopt) and P_adopt > 0) else 5.0
+if not (np.isfinite(P_adopt) and P_adopt > 0):
+    P_adopt = 5.0  # fallback for UI
 
-# Object-only fold control
+# Initialize fold period state once per new selection
+if st.session_state.fold_period is None or st.session_state.get("fold_period_for") != selected:
+    st.session_state.fold_period = float(P_adopt)
+    st.session_state.fold_period_for = selected
+    st.session_state.fold_pct = DEFAULT_PCT
+
 st.sidebar.subheader("Photometry fold controls")
-if np.isfinite(P_adopt) and P_adopt > 0:
-    pct = st.sidebar.slider("Explore ±% around adopted P", 0.0, 20.0, 5.0, 0.5)
-    lo = max(1e-6, P_adopt * (1.0 - pct / 100.0))
-    hi = P_adopt * (1.0 + pct / 100.0)
-    P_calc = st.sidebar.slider("Fold period (hr)", float(lo), float(hi), float(P_adopt))
-else:
-    P_calc = st.sidebar.number_input("Fold period (hr)", min_value=1e-6, value=float(P_calc))
+
+# Reset button under period slider (requested)
+# We'll place it after the period slider, but the button affects both sliders.
+# (Streamlit buttons trigger rerun immediately.)
+# Control order requested: Fold period slider ABOVE ±% slider.
+# To do that: choose pct first (defines bounds), but DISPLAY period slider first by using current pct value.
+pct = float(st.session_state.fold_pct)
+lo = max(1e-6, float(P_adopt) * (1.0 - pct / 100.0))
+hi = float(P_adopt) * (1.0 + pct / 100.0)
+# Clamp current period into bounds
+curP = float(st.session_state.fold_period)
+curP = min(max(curP, lo), hi)
+
+st.session_state.fold_period = st.sidebar.slider(
+    "Fold period (hr)",
+    min_value=float(lo),
+    max_value=float(hi),
+    value=float(curP),
+    step=float((hi - lo) / 400.0) if hi > lo else 1e-6,
+    key="fold_period_slider",
+)
+
+if st.sidebar.button("Reset to adopted", use_container_width=True):
+    st.session_state.fold_pct = DEFAULT_PCT
+    st.session_state.fold_period = float(P_adopt)
+    # Also update the widget keys on rerun
+    st.session_state["fold_pct_slider"] = DEFAULT_PCT
+    st.session_state["fold_period_slider"] = float(P_adopt)
+    st.rerun()
+
+st.session_state.fold_pct = st.sidebar.slider(
+    "Explore ±% around adopted P",
+    0.0, 20.0, float(st.session_state.fold_pct), 0.5,
+    key="fold_pct_slider",
+)
+
+# Recompute bounds after pct change and clamp fold_period if needed
+pct2 = float(st.session_state.fold_pct)
+lo2 = max(1e-6, float(P_adopt) * (1.0 - pct2 / 100.0))
+hi2 = float(P_adopt) * (1.0 + pct2 / 100.0)
+if not (lo2 <= float(st.session_state.fold_period) <= hi2):
+    st.session_state.fold_period = float(min(max(float(st.session_state.fold_period), lo2), hi2))
+
+P_calc = float(st.session_state.fold_period)
 
 # -------------------------
 # Sidebar: POPULATION filters (below object sliders)
@@ -197,18 +264,23 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.header("Population filters")
 
-# Reliability
 rel_series = master.get("Reliability", pd.Series([], dtype=str)).dropna().astype(str)
 rel_options = sorted(rel_series.unique().tolist()) if len(rel_series) else ["reliable", "ambiguous", "insufficient", "unknown"]
+
+# default to all
 selected_rels = st.sidebar.multiselect("Reliability", options=rel_options, default=rel_options)
 
-# Adopted period range
+# IMPORTANT: if user clears it, treat as "all" (prevents blank population view confusion)
+if not selected_rels:
+    selected_rels = rel_options
+
 p_col = "Adopted period (hr)"
 if p_col in master.columns and master[p_col].notna().any():
     pmin = float(np.nanmin(master[p_col]))
     pmax = float(np.nanmax(master[p_col]))
 else:
     pmin, pmax = 0.0, 100.0
+
 p_lo, p_hi = st.sidebar.slider(
     "Adopted period range (hr)",
     min_value=float(max(0.0, pmin)),
@@ -216,13 +288,13 @@ p_lo, p_hi = st.sidebar.slider(
     value=(float(max(0.0, pmin)), float(max(1.0, pmax))),
 )
 
-# Number of observations range
 n_col = "Number of Observations"
 if n_col in master.columns and master[n_col].notna().any():
     nmin = int(np.nanmin(master[n_col]))
     nmax = int(np.nanmax(master[n_col]))
 else:
     nmin, nmax = 0, 1000
+
 n_lo, n_hi = st.sidebar.slider(
     "Number of observations",
     min_value=int(max(0, nmin)),
@@ -230,7 +302,6 @@ n_lo, n_hi = st.sidebar.slider(
     value=(int(max(0, nmin)), int(max(1, nmax))),
 )
 
-# Filtered population dataframe (used in Population tab)
 df_f = master.copy()
 if "Reliability" in df_f.columns:
     df_f = df_f[df_f["Reliability"].astype(str).isin(selected_rels)]
@@ -238,6 +309,7 @@ if p_col in df_f.columns:
     df_f = df_f[df_f[p_col].between(p_lo, p_hi, inclusive="both")]
 if n_col in df_f.columns:
     df_f = df_f[df_f[n_col].between(n_lo, n_hi, inclusive="both")]
+
 st.sidebar.caption(f"{len(df_f):,} objects match population filters")
 
 # ==========================================================
@@ -249,11 +321,12 @@ tab_photo, tab_char, tab_pop = st.tabs(["Photometry", "Characterisation", "Popul
 # TAB: Photometry (raw fold preview)
 # ==========================================================
 with tab_photo:
-    st.subheader(f"Raw fold preview: {selected}")
+    rel_here = reliability_short(str(row.get("Reliability", "")))
+    st.subheader(f"Raw fold preview: {selected} ({rel_here})")
 
     st.warning(
         "Caveat: These fold plots use RAW Rubin First Look magnitudes (no geometric corrections / phase-distance correction / "
-        "band-centering yet). Geometry-corrected folds are coming soon and will replace this as the default validation view."
+        "band-centering yet). Geometry-corrected folds are coming soon."
     )
 
     if not RAW_PHOTO_PATH.exists():
@@ -267,21 +340,22 @@ with tab_photo:
         df_raw["band"] = "x"
     df_raw["band"] = df_raw["band"].astype(str).str.strip().str.lower()
 
-    # Object id column discovery
-    obj_col = None
-    for cand in ["Designation", "designation", "provid", "PROVID", "object", "object_id", "ssobjectid", "ssObjectId"]:
-        if cand in df_raw.columns:
-            obj_col = cand
-            break
+    # Object id column discovery (we'll try several; then match by normalized value)
+    id_candidates = ["Designation", "designation", "provid", "PROVID", "object", "object_id", "ssobjectid", "ssObjectId"]
+    obj_col = next((c for c in id_candidates if c in df_raw.columns), None)
     if obj_col is None:
         st.error("Could not find an object identifier column in bq-results.csv (e.g., Designation/provid/ssObjectId).")
         with st.expander("Debug: show columns"):
             st.write(list(df_raw.columns))
         st.stop()
 
-    df_o = df_raw[df_raw[obj_col].astype(str) == str(selected)].copy()
+    # Normalized match
+    target = norm_id(selected)
+    s_norm = df_raw[obj_col].map(norm_id)
+    df_o = df_raw[s_norm == target].copy()
+
     if len(df_o) == 0:
-        st.info(f"No rows in raw photometry matched {obj_col} == '{selected}'.")
+        st.info(f"No rows in raw photometry matched {obj_col} == '{selected}' (after normalization).")
         with st.expander("Debug: show unique IDs (first 200)"):
             st.write(df_raw[obj_col].astype(str).unique().tolist()[:200])
         st.stop()
@@ -344,7 +418,7 @@ with tab_photo:
         m = (bands == b)
         ax.scatter(t_hr[m], mag[m], s=10, label=b)
     ax.invert_yaxis()
-    ax.set_xlabel(f"{time_label}")
+    ax.set_xlabel(time_label)
     ax.set_ylabel(mag_col)
     ax.set_title("Raw magnitude vs time (no geometric corrections)")
     ax.legend(fontsize=8, ncol=6)
@@ -363,12 +437,7 @@ with tab_char:
     st.subheader(f"Characterisation: {selected}")
     st.caption("Values in this tab come from master_results_clean.csv (Step 13 exports).")
 
-    top_l, top_r = st.columns([0.7, 0.3])
-    with top_l:
-        st.markdown(f"**Status:** {reliability_badge(str(row.get('Reliability', '')))}")
-    with top_r:
-        tf = row.get("Bootstrap top_frac", np.nan)
-        st.markdown(f"**Bootstrap top_frac:** {format_float(tf, 3)}")
+    st.markdown(f"**Status:** {reliability_badge(str(row.get('Reliability', '')))}")
 
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Adopted P (hr)", format_float(row.get("Adopted period (hr)", np.nan), 6))
@@ -382,7 +451,7 @@ with tab_char:
     b2.metric("Arc (days)", format_float(row.get("Arc (days)", np.nan), 3))
     b3.metric("2P candidate (hr)", format_float(row.get("2P candidate (hr)", np.nan), 6))
     b4.metric("ΔBIC(2P−P)", format_float(row.get("ΔBIC(2P−P)", np.nan), 3))
-    b5.metric("Mean r mag", format_float(row.get("Mean Mag (r Band)", np.nan), 3))
+    b5.metric("Bootstrap top_frac", format_float(row.get("Bootstrap top_frac", np.nan), 3))
 
     st.markdown("### Colors")
     c1, c2, c3 = st.columns(3)
@@ -401,6 +470,14 @@ with tab_char:
 # ==========================================================
 with tab_pop:
     st.subheader("Population overview (filtered by sidebar)")
+
+    if len(df_f) == 0:
+        st.warning(
+            "No objects match your current population filters. "
+            "Tip: re-add Reliability options (or click the 'x' chips) and/or widen the period / N_obs ranges."
+        )
+        st.stop()
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Objects (filtered)", f"{len(df_f):,}")
     if "Reliability" in df_f.columns:
@@ -419,25 +496,30 @@ with tab_pop:
         y = df_f["Amplitude (Fourier)"].to_numpy(float)
         m = np.isfinite(x) & np.isfinite(y)
 
-        fig, ax = plt.subplots(figsize=(8.5, 4.5))
-        ax.scatter(x[m], y[m], s=10)
-        ax.set_xlabel("Adopted period (hr)")
-        ax.set_ylabel("Amplitude (Fourier, mag)")
-        ax.set_title("Period vs amplitude (filtered)")
-        st.pyplot(fig, clear_figure=True)
+        if m.sum() == 0:
+            st.info("No finite Period/Amplitude points under current filters.")
+        else:
+            fig, ax = plt.subplots(figsize=(8.5, 4.5))
+            ax.scatter(x[m], y[m], s=10)
+            ax.set_xlabel("Adopted period (hr)")
+            ax.set_ylabel("Amplitude (Fourier, mag)")
+            ax.set_title("Period vs amplitude (filtered)")
+            st.pyplot(fig, clear_figure=True)
 
     # Histogram
     if "Adopted period (hr)" in df_f.columns:
         st.markdown("### Adopted period distribution")
         periods = df_f["Adopted period (hr)"].to_numpy(float)
         periods = periods[np.isfinite(periods)]
-
-        fig, ax = plt.subplots(figsize=(8.5, 4.0))
-        ax.hist(periods, bins=50)
-        ax.set_xlabel("Adopted period (hr)")
-        ax.set_ylabel("Count")
-        ax.set_title("Adopted period histogram")
-        st.pyplot(fig, clear_figure=True)
+        if len(periods) == 0:
+            st.info("No finite adopted periods under current filters.")
+        else:
+            fig, ax = plt.subplots(figsize=(8.5, 4.0))
+            ax.hist(periods, bins=50)
+            ax.set_xlabel("Adopted period (hr)")
+            ax.set_ylabel("Count")
+            ax.set_title("Adopted period histogram")
+            st.pyplot(fig, clear_figure=True)
 
     st.markdown("### Master table (filtered)")
     show_cols = [
