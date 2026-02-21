@@ -1,12 +1,11 @@
 # app.py
 # ==========================================================
 # ATLAST Rotation Dashboard (Master-powered + Raw fold preview)
-# UPDATE (per latest request):
-# - Raw plot filters LIVE UNDER "Asteroid" section (not Population section)
-# - Remove Raw "Magnitude Range" filter
-# - Remove Raw "Time Window" filter
-# - Keep only Raw "Bands" filter + Fold Period controls under Asteroid
-# - Population section remains strictly population-only sliders/filters
+# UPDATE (per request):
+# - Move "Bands (Raw)" filter directly under Fold Controls
+# - Remove the "Raw Plot Filters" header text AND its divider line
+# - Ensure LSST band options are always present (g, r, i, z, y, u)
+#   even if a band isn't present for the selected asteroid
 # ==========================================================
 
 from __future__ import annotations
@@ -187,7 +186,7 @@ st.markdown("## ATLAST Asteroid Rotation Dashboard")
 st.caption("Photometry uses raw Rubin First Look magnitudes for fold previews. Geometry-corrected validation is coming soon.")
 
 # -------------------------
-# Sidebar: Asteroid selection + fold controls + raw band filter
+# Sidebar: Asteroid selection
 # -------------------------
 st.sidebar.markdown("## Asteroid")
 
@@ -213,6 +212,9 @@ P_adopt = float(row.get("Adopted period (hr)", np.nan))
 if not (np.isfinite(P_adopt) and P_adopt > 0):
     P_adopt = 5.0
 
+# -------------------------
+# Sidebar: Fold controls
+# -------------------------
 st.sidebar.markdown("---")
 st.sidebar.markdown("## Fold Controls")
 
@@ -236,18 +238,29 @@ if st.sidebar.button("Reset To Adopted Period", use_container_width=True):
     st.session_state.fold_period = float(P_adopt)
     st.rerun()
 
-# Raw band filter stays in ASTEROID section (not population)
-st.sidebar.markdown("---")
-st.sidebar.markdown("## Raw Plot Filters")
+# ---- Bands filter directly under fold controls (requested) ----
+# Ensure LSST band options always exist in the UI
+LSST_BANDS = ["u", "g", "r", "i", "z", "y"]
 
-# We'll fill this once we load df_o in Photometry tab; keep a placeholder UI state
 if "raw_band_filter" not in st.session_state:
-    st.session_state.raw_band_filter = None
+    st.session_state.raw_band_filter = LSST_BANDS[:]  # default all
 if "raw_band_for" not in st.session_state:
     st.session_state.raw_band_for = None
 
+# We'll refine the default bands per asteroid AFTER loading raw data in Photometry tab.
+# But the UI stays here under Fold Controls.
+sel_bands_sidebar = st.sidebar.multiselect(
+    "Bands (Raw)",
+    options=LSST_BANDS,
+    default=st.session_state.raw_band_filter if isinstance(st.session_state.raw_band_filter, list) else LSST_BANDS,
+    key="raw_band_widget",
+)
+if not sel_bands_sidebar:
+    sel_bands_sidebar = LSST_BANDS
+st.session_state.raw_band_filter = sel_bands_sidebar
+
 # -------------------------
-# Sidebar: Population filters (population only)
+# Sidebar: Population filters
 # -------------------------
 st.sidebar.markdown("---")
 st.sidebar.markdown("## Population Filters")
@@ -302,7 +315,6 @@ with tab_photo:
         unsafe_allow_html=True,
     )
 
-    # Supporting stats
     n_obs_master = row.get("Number of Observations", np.nan)
     arc_days = row.get("Arc (days)", np.nan)
 
@@ -362,27 +374,12 @@ with tab_photo:
     df_o[mag_col] = pd.to_numeric(df_o[mag_col], errors="coerce")
     df_o = df_o.dropna(subset=["t_hr", mag_col, "band"])
 
-    # Nights
     n_nights = resolve_nights(df_o)
 
-    # Band filter UI (now that we know available bands)
-    all_bands = sorted([b for b in df_o["band"].dropna().astype(str).unique().tolist() if b.strip() != ""])
-    if not all_bands:
-        all_bands = ["x"]
-
-    if st.session_state.raw_band_filter is None or st.session_state.raw_band_for != selected:
-        st.session_state.raw_band_filter = all_bands
-        st.session_state.raw_band_for = selected
-
-    sel_bands = st.sidebar.multiselect(
-        "Bands (Raw)",
-        options=all_bands,
-        default=st.session_state.raw_band_filter,
-        key="raw_band_widget",
-    )
+    # Apply band filter from sidebar (keep only selected LSST bands that exist)
+    sel_bands = [b for b in st.session_state.raw_band_filter if b in set(df_o["band"].unique())]  # filter to available
     if not sel_bands:
-        sel_bands = all_bands
-    st.session_state.raw_band_filter = sel_bands
+        sel_bands = sorted(df_o["band"].unique().tolist())
 
     dfp = df_o[df_o["band"].astype(str).isin(sel_bands)].copy()
 
