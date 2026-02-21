@@ -1,577 +1,432 @@
+# app.py
+# ==========================================================
+# ATLAST Rotation Dashboard (Master-powered + Raw fold caveat)
+# - Population science view from master_results_clean.csv
+# - Object view from master_results_clean.csv
+# - Fold plots from raw bq-results.csv (NO geometry correction yet)
+# - Periodogram / bootstrap / candidate table: Coming soon placeholders
+# ==========================================================
+
+from __future__ import annotations
+
 import os
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# Optional (periodogram)
-try:
-    from astropy.timeseries import LombScargle
-    HAS_ASTROPY = True
-except Exception:
-    HAS_ASTROPY = False
-
-# --------------------------
-# App config
-# --------------------------
-st.set_page_config(page_title="ATLAST Rotation Dashboard", layout="wide")
-
-
-st.markdown(
-    """
-    <style>
-      /* Sticky header container */
-      .sticky-header {
-        position: sticky;
-        top: 0;
-        z-index: 999;
-        background: var(--background-color);
-        padding-top: 0.25rem;
-        padding-bottom: 0.25rem;
-        border-bottom: 1px solid rgba(49, 51, 63, 0.2);
-      }
-      /* Reduce extra top padding Streamlit adds */
-      div.block-container { padding-top: 1rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
+# -------------------------
+# Page config
+# -------------------------
+st.set_page_config(
+    page_title="ATLAST Rotation Dashboard",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# --- Mode toggle (header row) ---
+# -------------------------
+# Files (edit these if your repo paths differ)
+# -------------------------
+MASTER_PATH = Path("master_results_clean.csv")                 # required
+RAW_PHOTO_PATH = Path("bq-results.csv")                        # optional (raw Rubin First Look photometry)
+
+# -------------------------
+# Helpers
+# -------------------------
+@st.cache_data(show_spinner=False)
+def load_master(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    # Ensure Designation exists
+    if "Designation" not in df.columns:
+        for c in ["provid", "PROVID", "designation", "name", "object_id"]:
+            if c in df.columns:
+                df = df.rename(columns={c: "Designation"})
+                break
+    return df
+
+@st.cache_data(show_spinner=False)
+def load_raw_photometry(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path)
+
+def safe_num(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce")
+
+def has_cols(df: pd.DataFrame, cols: list[str]) -> bool:
+    return all(c in df.columns for c in cols)
+
+def format_float(x, nd=6) -> str:
+    try:
+        if np.isfinite(float(x)):
+            return f"{float(x):.{nd}f}"
+    except Exception:
+        pass
+    return "—"
+
+def plot_fold(ax, t_hr: np.ndarray, mag: np.ndarray, bands: np.ndarray, P_hr: float, title: str):
+    phase = (t_hr / float(P_hr)) % 1.0
+    uniq = sorted(np.unique(bands).tolist())
+    for b in uniq:
+        m = (bands == b)
+        ax.scatter(phase[m], mag[m], s=10, label=str(b))
+        ax.scatter(phase[m] + 1.0, mag[m], s=10)
+    ax.invert_yaxis()
+    ax.set_xlabel("Phase")
+    ax.set_ylabel("Raw mag")
+    ax.set_title(title)
+
+# -------------------------
+# Load master
+# -------------------------
+if not MASTER_PATH.exists():
+    st.error(f"Missing required file: {MASTER_PATH}")
+    st.stop()
+
+master = load_master(MASTER_PATH)
+
+# Normalize numeric cols (don’t overwrite strings)
+NUM_COLS = [
+    "H Mag", "Mean Mag (r Band)", "Number of Observations", "Arc (days)",
+    "LS peak period (hr)", "Adopted period (hr)", "Adopted K",
+    "2P candidate (hr)", "ΔBIC(2P−P)",
+    "Amplitude (Fourier)", "g - r", "g - i", "r - i", "Axial Elongation",
+    "Bootstrap top_frac", "Bootstrap n_unique_winners", "Bootstrap family_size",
+]
+for c in NUM_COLS:
+    if c in master.columns:
+        master[c] = safe_num(master[c])
+
+# -------------------------
+# Header row: title + mode toggle
+# -------------------------
 h1, h2 = st.columns([0.75, 0.25])
 with h1:
     st.title("ATLAST Asteroid Rotation Dashboard")
-
+    st.caption("Population science from master results + object-level raw fold preview (geometry corrections coming soon).")
 with h2:
-    mode = None
-    # Prefer segmented_control if available (newer Streamlit)
-    if hasattr(st, "segmented_control"):
-        mode = st.segmented_control(
-            "Mode",
-            options=["Simple", "Research"],
-            default="Simple",
-            label_visibility="collapsed",
-            key="ui_mode",
-        )
-    else:
-        mode = st.radio(
-            "Mode",
-            ["Simple", "Research"],
-            horizontal=True,
-            label_visibility="collapsed",
-            key="ui_mode",
-        )
-
+    mode = st.radio(
+        "Mode",
+        ["Simple", "Research"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="ui_mode",
+    )
 is_research = (mode == "Research")
 
-# --------------------------
-# Files / directories
-# --------------------------
-MASTER_FILE = Path("master_results_clean.csv")
-OVERRIDES_FILE = Path("overrides.csv")
-PHOTO_FILE = Path("bq-results.csv")          # repo photometry
-PIPELINE_ROOT = Path("outputs")              # where you store per-object outputs
-OBJECTS_DIR = PIPELINE_ROOT / "objects"      # outputs/objects/<provid>/
+# -------------------------
+# Sidebar controls
+# -------------------------
+st.sidebar.header("Controls")
 
-# --------------------------
-# Helpers
-# --------------------------
-def _as_str(x) -> str:
-    return "" if x is None else str(x)
+# Reliability filter
+rel_options = sorted([x for x in master.get("Reliability", pd.Series([], dtype=str)).dropna().astype(str).unique().tolist()])
+if not rel_options:
+    rel_options = ["reliable", "ambiguous", "insufficient", "unknown"]
 
-def _safe_num(x):
-    return pd.to_numeric(x, errors="coerce")
-
-def _norm_provid(p: str) -> str:
-    return _as_str(p).strip()
-
-def _obj_dir(provid: str) -> Path:
-    return OBJECTS_DIR / _norm_provid(provid).replace(" ", "_")
-
-def _read_csv_if_exists(path: Path):
-    if path.exists():
-        try:
-            return pd.read_csv(path)
-        except Exception:
-            return None
-    return None
-
-def _read_parquet_if_exists(path: Path):
-    if path.exists():
-        try:
-            return pd.read_parquet(path)
-        except Exception:
-            return None
-    return None
-
-# --------------------------
-# Load data
-# --------------------------
-@st.cache_data(show_spinner=False)
-def load_master() -> pd.DataFrame:
-    return pd.read_csv(MASTER_FILE)
-
-@st.cache_data(show_spinner=False)
-def load_overrides() -> pd.DataFrame:
-    if OVERRIDES_FILE.exists():
-        return pd.read_csv(OVERRIDES_FILE)
-    return pd.DataFrame(columns=["provid", "triage_manual", "P_manual_hr", "notes"])
-
-@st.cache_data(show_spinner=False)
-def load_photometry() -> pd.DataFrame:
-    return pd.read_csv(PHOTO_FILE, low_memory=False)
-
-try:
-    df_master = load_master()
-except Exception as e:
-    st.error(f"Could not load {MASTER_FILE}: {e}")
-    st.stop()
-
-df_master = df_master.copy()
-df_master["provid"] = df_master["provid"].astype(str)
-
-df_ovr = load_overrides().copy()
-if "provid" in df_ovr.columns:
-    df_ovr["provid"] = df_ovr["provid"].astype(str)
-
-# --------------------------
-# Apply overrides (clean + predictable)
-# --------------------------
-if len(df_ovr) > 0 and "provid" in df_ovr.columns:
-    df = df_master.merge(df_ovr, on="provid", how="left")
-
-    # manual triage override
-    if "triage_manual" in df.columns:
-        m = df["triage_manual"].fillna("").astype(str).str.strip()
-        if "triage_final" in df.columns:
-            df.loc[m != "", "triage_final"] = m[m != ""]
-        else:
-            df["triage_final"] = np.where(m != "", m, df.get("triage_final", ""))
-
-    # manual period override
-    if "P_manual_hr" in df.columns and "P_final_hr" in df.columns:
-        pman = _safe_num(df["P_manual_hr"])
-        df.loc[pman.notna(), "P_final_hr"] = pman[pman.notna()]
-else:
-    df = df_master
-
-# If triage_final missing, make it exist
-if "triage_final" not in df.columns:
-    df["triage_final"] = df.get("reliability", "unknown")
-
-# --------------------------
-# Sidebar Filters
-# --------------------------
-st.sidebar.header("Triage Filters")
-
-triage_options = sorted(df["triage_final"].dropna().astype(str).unique())
-selected_triage = st.sidebar.multiselect("Class", triage_options, default=triage_options)
-
-top_only = st.sidebar.checkbox("Top reliable only (confidence ≥ 80)", value=False)
-
-df_f = df[df["triage_final"].astype(str).isin(selected_triage)].copy()
-if top_only and "confidence" in df_f.columns:
-    df_f = df_f[_safe_num(df_f["confidence"]) >= 80].copy()
-
-# ----------------------------------------------------
-# IMPORTANT: Build df_sorted HERE (before sidebar select)
-# ----------------------------------------------------
-display_cols = [
-    c for c in [
-        "provid", "triage_final", "confidence",
-        "P_final_hr", "sigma_sec",
-        "N_obs", "arc_days",
-        "bootstrap_top_frac", "bootstrap_n_unique",
-        "g_r", "g_i", "r_i",
-        "run_id_utc", "pipeline_version"
-    ] if c in df_f.columns
-]
-
-sort_cols = ["triage_final"]
-ascending = [True]
-if "confidence" in df_f.columns:
-    sort_cols.append("confidence")
-    ascending.append(False)
-
-# If df_f is empty, avoid errors
-df_sorted = df_f.sort_values(sort_cols, ascending=ascending).reset_index(drop=True) if len(df_f) else df_f.copy()
-
-# --------------------------
-# Sidebar asteroid selector
-# --------------------------
-st.sidebar.header("Asteroid")
-
-asteroid_list = df_sorted["provid"].astype(str).tolist() if "provid" in df_sorted.columns else []
-
-if len(asteroid_list) == 0:
-    st.warning("No asteroids match filters.")
-    st.stop()
-
-if "selected_asteroid" not in st.session_state:
-    st.session_state["selected_asteroid"] = asteroid_list[0]
-
-if st.session_state["selected_asteroid"] not in asteroid_list:
-    st.session_state["selected_asteroid"] = asteroid_list[0]
-
-selected = st.sidebar.selectbox(
-    "Choose asteroid",
-    asteroid_list,
-    index=asteroid_list.index(st.session_state["selected_asteroid"])
+selected_rels = st.sidebar.multiselect(
+    "Reliability",
+    options=rel_options,
+    default=rel_options,
 )
-st.session_state["selected_asteroid"] = selected
 
-row = df[df["provid"].astype(str) == str(selected)].iloc[0]
-st.header(selected)
+# Period filter
+p_col = "Adopted period (hr)"
+pmin = float(np.nanmin(master[p_col])) if p_col in master.columns and master[p_col].notna().any() else 0.0
+pmax = float(np.nanmax(master[p_col])) if p_col in master.columns and master[p_col].notna().any() else 100.0
+p_lo, p_hi = st.sidebar.slider(
+    "Adopted period range (hr)",
+    min_value=float(max(0.0, pmin)),
+    max_value=float(max(1.0, pmax)),
+    value=(float(max(0.0, pmin)), float(max(1.0, pmax))),
+)
 
-# --------------------------
+# Observations filter
+n_col = "Number of Observations"
+nmin = int(np.nanmin(master[n_col])) if n_col in master.columns and master[n_col].notna().any() else 0
+nmax = int(np.nanmax(master[n_col])) if n_col in master.columns and master[n_col].notna().any() else 1000
+n_lo, n_hi = st.sidebar.slider(
+    "Number of observations",
+    min_value=int(max(0, nmin)),
+    max_value=int(max(1, nmax)),
+    value=(int(max(0, nmin)), int(max(1, nmax))),
+)
+
+# Text search
+q = st.sidebar.text_input("Search designation contains", value="", placeholder="e.g., 2025 MA19")
+
+# Apply filters
+df_f = master.copy()
+if "Reliability" in df_f.columns:
+    df_f = df_f[df_f["Reliability"].astype(str).isin(selected_rels)]
+if p_col in df_f.columns:
+    df_f = df_f[df_f[p_col].between(p_lo, p_hi, inclusive="both")]
+if n_col in df_f.columns:
+    df_f = df_f[df_f[n_col].between(n_lo, n_hi, inclusive="both")]
+if q.strip():
+    df_f = df_f[df_f["Designation"].astype(str).str.contains(q.strip(), case=False, na=False)]
+
+df_f = df_f.sort_values(["Reliability", "Adopted period (hr)"] if "Reliability" in df_f.columns and "Adopted period (hr)" in df_f.columns else ["Designation"])
+
+st.sidebar.caption(f"{len(df_f):,} objects match filters")
+
+# Pick object
+designations = df_f["Designation"].astype(str).tolist()
+if not designations:
+    st.warning("No objects match your filters.")
+    st.stop()
+
+selected = st.sidebar.selectbox("Selected object", options=designations, index=0)
+
+# Selected row
+row = df_f[df_f["Designation"].astype(str) == str(selected)]
+row = row.iloc[0].to_dict() if len(row) else {}
+
+P_adopt = float(row.get("Adopted period (hr)", np.nan))
+P_calc = P_adopt
+
+# Period slider (always visible, but conservative in Simple mode)
+if np.isfinite(P_adopt) and P_adopt > 0:
+    pct_default = 2.0 if not is_research else 5.0
+    pct = st.sidebar.slider("Fold period explore ±%", 0.0, 20.0, pct_default, 0.5)
+    lo = max(1e-6, P_adopt * (1.0 - pct / 100.0))
+    hi = P_adopt * (1.0 + pct / 100.0)
+    P_calc = st.sidebar.slider("Fold period (hr)", float(lo), float(hi), float(P_adopt))
+else:
+    P_calc = st.sidebar.number_input("Fold period (hr)", min_value=1e-6, value=5.0)
+
+# -------------------------
 # Tabs
-# --------------------------
-tab_key, tab_photo, tab_pipeline = st.tabs(["Key results", "Photometry explorer", "Pipeline diagnostics"])
+# -------------------------
+tab_pop, tab_obj, tab_photo = st.tabs(["Population", "Object", "Photometry (Raw Fold Preview)"])
 
-# ==========================
-# Key Results
-# ==========================
-with tab_key:
-    st.subheader("Key Results (pipeline outputs)")
+# ==========================================================
+# TAB: Population
+# ==========================================================
+with tab_pop:
+    st.subheader("Population overview (from master_results_clean.csv)")
 
-    key_cols = [
-        c for c in [
-            "triage_final", "confidence",
-            "P_final_hr", "P_p16_hr", "P_p50_hr", "P_p84_hr",
-            "sigma_sec",
-            "bootstrap_top_frac", "bootstrap_n_unique",
-            "N_obs", "arc_days",
-            "g_r", "g_i", "r_i",
-            "run_id_utc", "pipeline_version", "last_updated_utc"
-        ] if c in row.index
-    ]
-    if key_cols:
-        st.table(row[key_cols])
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Objects (filtered)", f"{len(df_f):,}")
+    if "Reliability" in df_f.columns:
+        c2.metric("Reliable", f"{int((df_f['Reliability'].astype(str) == 'reliable').sum()):,}")
+        c3.metric("Ambiguous", f"{int((df_f['Reliability'].astype(str) == 'ambiguous').sum()):,}")
+        c4.metric("Insufficient", f"{int((df_f['Reliability'].astype(str) == 'insufficient').sum()):,}")
     else:
-        st.info("No key columns found in master file for this object.")
+        c2.metric("Reliable", "—")
+        c3.metric("Ambiguous", "—")
+        c4.metric("Insufficient", "—")
 
-    extra_cols = [c for c in ["2P candidate (hr)", "ΔBIC(2P−P)", "LS peak period (hr)"] if c in df.columns]
-    if extra_cols:
-        st.caption("Extra period-evidence fields (if present in master CSV)")
-        st.table(row[extra_cols])
+    # Key scatter: Period vs Amplitude
+    if "Adopted period (hr)" in df_f.columns and "Amplitude (Fourier)" in df_f.columns:
+        st.markdown("### Period vs amplitude")
+        x = df_f["Adopted period (hr)"].to_numpy(float)
+        y = df_f["Amplitude (Fourier)"].to_numpy(float)
 
-# ==========================
-# Photometry Explorer
-# ==========================
+        fig, ax = plt.subplots(figsize=(8.5, 4.5))
+        ax.scatter(x[np.isfinite(x) & np.isfinite(y)], y[np.isfinite(x) & np.isfinite(y)], s=10)
+        ax.set_xlabel("Adopted period (hr)")
+        ax.set_ylabel("Amplitude (Fourier, mag)")
+        ax.set_title("Period vs amplitude (filtered)")
+        st.pyplot(fig, clear_figure=True)
+    else:
+        st.info("Period vs amplitude requires 'Adopted period (hr)' and 'Amplitude (Fourier)' in master.")
+
+    # Histogram: adopted period
+    if "Adopted period (hr)" in df_f.columns:
+        st.markdown("### Adopted period distribution")
+        periods = df_f["Adopted period (hr)"].to_numpy(float)
+        periods = periods[np.isfinite(periods)]
+        bins = 60 if is_research else 40
+
+        fig, ax = plt.subplots(figsize=(8.5, 4.0))
+        ax.hist(periods, bins=bins)
+        ax.set_xlabel("Adopted period (hr)")
+        ax.set_ylabel("Count")
+        ax.set_title("Adopted period histogram")
+        st.pyplot(fig, clear_figure=True)
+
+    # Table
+    st.markdown("### Master table (filtered)")
+    show_cols = [
+        "Designation",
+        "Adopted period (hr)",
+        "LS peak period (hr)",
+        "Amplitude (Fourier)",
+        "Axial Elongation",
+        "Reliability",
+        "Bootstrap top_frac",
+        "Number of Observations",
+        "Arc (days)",
+    ]
+    show_cols = [c for c in show_cols if c in df_f.columns]
+    st.dataframe(df_f[show_cols].reset_index(drop=True), use_container_width=True, height=420)
+
+    # Download filtered
+    st.download_button(
+        "Download filtered master CSV",
+        data=df_f.to_csv(index=False).encode("utf-8"),
+        file_name="master_results_filtered.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+# ==========================================================
+# TAB: Object
+# ==========================================================
+with tab_obj:
+    st.subheader(f"Object summary: {selected}")
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Adopted P (hr)", format_float(row.get("Adopted period (hr)", np.nan), 6))
+    k2.metric("LS peak P (hr)", format_float(row.get("LS peak period (hr)", np.nan), 6))
+    k3.metric("Amplitude (mag)", format_float(row.get("Amplitude (Fourier)", np.nan), 3))
+    k4.metric("Axial elongation", format_float(row.get("Axial Elongation", np.nan), 3))
+    k5.metric("Reliability", str(row.get("Reliability", "—")))
+
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("Bootstrap top_frac", format_float(row.get("Bootstrap top_frac", np.nan), 3))
+    r2.metric("n_unique_winners", str(row.get("Bootstrap n_unique_winners", "—")))
+    r3.metric("family_size", str(row.get("Bootstrap family_size", "—")))
+    r4.metric("ΔBIC(2P−P)", format_float(row.get("ΔBIC(2P−P)", np.nan), 3))
+
+    st.markdown("### Colors")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("g - r", format_float(row.get("g - r", np.nan), 4))
+    c2.metric("g - i", format_float(row.get("g - i", np.nan), 4))
+    c3.metric("r - i", format_float(row.get("r - i", np.nan), 4))
+
+    if is_research:
+        st.markdown("### Ambiguity details")
+        amb = row.get("Ambiguous candidates (P_hr:frac)", "")
+        if isinstance(amb, str) and amb.strip():
+            st.code(amb, language="text")
+        else:
+            st.caption("No ambiguous candidate string stored for this object.")
+
+    st.markdown("### Coming soon (Research diagnostics)")
+    st.info(
+        "Periodogram, candidate BIC table, bootstrap histograms, and residual diagnostics will appear here once "
+        "per-object Step 11/12 outputs and geometry-corrected photometry are integrated into the dashboard."
+    )
+
+# ==========================================================
+# TAB: Photometry (Raw fold preview)
+# ==========================================================
 with tab_photo:
-    st.subheader("Photometry Explorer (exploratory folds + periodogram)")
+    st.subheader("Raw fold preview (Rubin First Look photometry)")
 
-    if not PHOTO_FILE.exists():
-        st.info(f"No photometry file found at {PHOTO_FILE}. Upload it to enable this tab.")
+    st.warning(
+        "Caveat: These fold plots use RAW Rubin First Look magnitudes (no geometric corrections / phase-distance correction / "
+        "band-centering yet). Geometry-corrected folds are coming soon and will replace this as the default validation view."
+    )
+
+    if not RAW_PHOTO_PATH.exists():
+        st.error(f"Raw photometry file not found: {RAW_PHOTO_PATH}")
         st.stop()
 
-    try:
-        df_photo = load_photometry()
-    except Exception as e:
-        st.error(f"Photometry failed to load: {e}")
+    df_raw = load_raw_photometry(RAW_PHOTO_PATH)
+
+    # Identify likely columns in raw file
+    # time: prefer t_hr else mjd/obstime_mjd (convert to hours since first obs in selection)
+    # mag: prefer mag else any magnitude-like column
+    # band: band if present
+    if "band" not in df_raw.columns:
+        df_raw["band"] = "x"
+    df_raw["band"] = df_raw["band"].astype(str).str.strip().str.lower()
+
+    # Select object rows (designation column may differ)
+    # Try typical name columns
+    obj_col = None
+    for cand in ["Designation", "designation", "provid", "PROVID", "object", "object_id", "ssobjectid", "ssObjectId"]:
+        if cand in df_raw.columns:
+            obj_col = cand
+            break
+    if obj_col is None:
+        st.error("Could not find an object identifier column in bq-results.csv (e.g., Designation/provid/ssObjectId).")
         st.stop()
 
-    needed = {"provid", "obstime", "mag", "rmsmag", "band"}
-    missing = [c for c in needed if c not in df_photo.columns]
-    if missing:
-        st.error(f"Photometry file missing columns: {missing}")
+    df_o = df_raw[df_raw[obj_col].astype(str) == str(selected)].copy()
+    if len(df_o) == 0:
+        st.info(f"No rows in raw photometry matched {obj_col} == '{selected}'.")
         st.stop()
 
-    df_obj = df_photo[df_photo["provid"].astype(str) == str(selected)].copy()
-    if len(df_obj) == 0:
-        st.warning("No photometry rows for this asteroid.")
+    # Time column detection
+    time_col = None
+    for cand in ["t_hr", "t_hours", "time_hr", "time_hours"]:
+        if cand in df_o.columns:
+            time_col = cand
+            break
+
+    if time_col is None:
+        if "mjd" in df_o.columns:
+            t = safe_num(df_o["mjd"]).to_numpy(float)
+            t0 = np.nanmin(t) if np.isfinite(t).any() else 0.0
+            df_o["t_hr"] = (t - t0) * 24.0
+            time_col = "t_hr"
+        elif "obstime_mjd" in df_o.columns:
+            t = safe_num(df_o["obstime_mjd"]).to_numpy(float)
+            t0 = np.nanmin(t) if np.isfinite(t).any() else 0.0
+            df_o["t_hr"] = (t - t0) * 24.0
+            time_col = "t_hr"
+        else:
+            st.error("Could not find time column in bq-results.csv. Expected t_hr or mjd/obstime_mjd.")
+            st.stop()
+
+    # Mag column detection
+    mag_col = None
+    for cand in ["mag", "magnitude", "psfMag", "psfmag", "cModelMag", "mag_auto"]:
+        if cand in df_o.columns:
+            mag_col = cand
+            break
+    if mag_col is None:
+        # last resort: any column containing "mag"
+        mag_like = [c for c in df_o.columns if "mag" in c.lower()]
+        if mag_like:
+            mag_col = mag_like[0]
+    if mag_col is None:
+        st.error("Could not find a magnitude column in raw photometry (expected 'mag' or similar).")
         st.stop()
 
-    df_obj["obstime"] = pd.to_datetime(df_obj["obstime"], errors="coerce", utc=True).dt.tz_convert(None)
-    df_obj["mag"] = _safe_num(df_obj["mag"])
-    df_obj["rmsmag"] = _safe_num(df_obj["rmsmag"])
-    df_obj["band"] = df_obj["band"].astype(str).str.strip().str.lower()
+    df_o[time_col] = safe_num(df_o[time_col])
+    df_o[mag_col] = safe_num(df_o[mag_col])
+    df_o = df_o.dropna(subset=[time_col, mag_col])
+    if len(df_o) < 5:
+        st.warning("Very few usable raw points after cleaning — fold plots may not be informative.")
 
-    df_obj = df_obj.dropna(subset=["obstime", "mag", "rmsmag", "band"]).sort_values("obstime")
+    t_hr = df_o[time_col].to_numpy(float)
+    mag = df_o[mag_col].to_numpy(float)
+    bands = df_o["band"].to_numpy(str)
 
-    st.sidebar.header("Photometry Controls")
-    bands = sorted(df_obj["band"].unique().tolist())
-    sel_bands = st.sidebar.multiselect("Bands", bands, default=bands)
+    # 3-panel fold (P/2, P, 2P) — based on selected P_calc
+    P_half = 0.5 * float(P_calc)
+    P_two = 2.0 * float(P_calc)
 
-    rms_min = float(df_obj["rmsmag"].min())
-    rms_max = float(df_obj["rmsmag"].max())
-    rms_default = float(df_obj["rmsmag"].quantile(0.90))
-    max_rms = st.sidebar.slider("Max rmsmag", rms_min, rms_max, rms_default)
-
-    df_plot = df_obj[(df_obj["band"].isin(sel_bands)) & (df_obj["rmsmag"] <= max_rms)].copy()
-    if len(df_plot) < 10:
-        st.warning("Too few photometry points after filters. Increase max rmsmag or select more bands.")
-        st.stop()
-
-    t0 = df_plot["obstime"].min()
-    t_hr = (df_plot["obstime"] - t0).dt.total_seconds().to_numpy() / 3600.0
-
-    df_plot["mag_detrend"] = df_plot["mag"] - df_plot.groupby("band")["mag"].transform("median")
-
-    st.markdown("### Raw Lightcurve (time domain)")
-    fig_raw, ax_raw = plt.subplots()
-    for b in sel_bands:
-        d = df_plot[df_plot["band"] == b]
-        ax_raw.scatter(d["obstime"], d["mag"], s=10, label=b)
-    ax_raw.invert_yaxis()
-    ax_raw.set_xlabel("Time")
-    ax_raw.set_ylabel("Magnitude")
-    ax_raw.legend()
-    st.pyplot(fig_raw, clear_figure=True)
-
-    P_calc = float(row["P_final_hr"]) if "P_final_hr" in row.index and pd.notna(row["P_final_hr"]) else np.nan
-    if not np.isfinite(P_calc) or P_calc <= 0:
-        st.warning("No valid P_final_hr for this asteroid.")
-        st.stop()
-
-    st.caption(f"Pipeline adopted period (P_final_hr): **{P_calc:.6f} h**")
-
-    st.markdown("## Quick validation")
-
-    def plot_fold(ax, t_hr_arr, mag_arr, bands_arr, P_hr, title):
-        phase = (t_hr_arr / P_hr) % 1.0
-        uniq = sorted(np.unique(bands_arr))
-        for b in uniq:
-            m = (bands_arr == b)
-            ax.scatter(phase[m], mag_arr[m], s=10, label=b)
-            ax.scatter(phase[m] + 1.0, mag_arr[m], s=10)
-        ax.invert_yaxis()
-        ax.set_xlabel("Phase")
-        ax.set_ylabel("Detrended mag")
-        ax.set_title(title)
-
+    st.markdown("### 3-panel fold: P/2 vs P vs 2P (RAW)")
     cols = st.columns(3)
-    periods = [0.5 * P_calc, P_calc, 2.0 * P_calc]
-    titles = [f"P/2 = {0.5*P_calc:.4f} h", f"P = {P_calc:.4f} h", f"2P = {2.0*P_calc:.4f} h"]
-
-    t_hr_arr = t_hr.astype(float)
-    mag_arr = df_plot["mag_detrend"].to_numpy(float)
-    bands_arr = df_plot["band"].to_numpy(str)
+    periods = [P_half, float(P_calc), P_two]
+    titles = [f"P/2 = {P_half:.6f} h", f"P = {float(P_calc):.6f} h", f"2P = {P_two:.6f} h"]
 
     for col, P_hr, title in zip(cols, periods, titles):
         with col:
-            fig, ax = plt.subplots()
-            plot_fold(ax, t_hr_arr, mag_arr, bands_arr, float(P_hr), title)
+            fig, ax = plt.subplots(figsize=(5.2, 3.6))
+            plot_fold(ax, t_hr=t_hr, mag=mag, bands=bands, P_hr=P_hr, title=title)
             ax.legend(fontsize=7)
             st.pyplot(fig, clear_figure=True)
 
-    boot_path = _obj_dir(selected) / "step12_bootstrap_winner_fractions.csv"
-    df_boot_quick = _read_csv_if_exists(boot_path)
+    st.markdown("### Raw time series (for context)")
+    fig, ax = plt.subplots(figsize=(10.5, 3.6))
+    for b in sorted(np.unique(bands).tolist()):
+        m = (bands == b)
+        ax.scatter(t_hr[m], mag[m], s=10, label=b)
+    ax.invert_yaxis()
+    ax.set_xlabel(f"{time_col} (hr since first obs in selection)")
+    ax.set_ylabel(mag_col)
+    ax.set_title("Raw magnitude vs time (no geometric corrections)")
+    ax.legend(fontsize=8, ncol=6)
+    st.pyplot(fig, clear_figure=True)
 
-    alias_periods = []
-    if df_boot_quick is not None and {"P_hr", "frac"}.issubset(df_boot_quick.columns):
-        tmp = df_boot_quick.copy()
-        tmp["P_hr"] = pd.to_numeric(tmp["P_hr"], errors="coerce")
-        tmp["frac"] = pd.to_numeric(tmp["frac"], errors="coerce")
-        tmp = tmp.dropna(subset=["P_hr", "frac"]).sort_values("frac", ascending=False)
-        for p in tmp["P_hr"].head(6).to_numpy(float):
-            if np.isfinite(p) and abs(p - P_calc) / P_calc > 0.002:
-                alias_periods.append(float(p))
-        alias_periods = alias_periods[:3]
-
-    st.markdown("### Periodogram (exploratory Lomb–Scargle)")
-    if not HAS_ASTROPY:
-        st.info("Install astropy to enable Lomb–Scargle periodogram (pip install astropy).")
-    else:
-        y = mag_arr
-        dy = df_plot["rmsmag"].to_numpy(float)
-        dy = np.where(np.isfinite(dy) & (dy > 0), dy, np.nan)
-        med_dy = np.nanmedian(dy) if np.isfinite(np.nanmedian(dy)) else 0.1
-        dy = np.where(np.isfinite(dy), dy, med_dy)
-
-        Pmin = max(0.05, 0.25 * P_calc)
-        Pmax = 4.0 * P_calc
-        fmin = 1.0 / Pmax
-        fmax = 1.0 / Pmin
-        freq = np.linspace(fmin, fmax, 3000)
-
-        ls = LombScargle(t_hr_arr, y, dy=dy)
-        power = ls.power(freq)
-        period = 1.0 / freq
-
-        fig_pg, ax_pg = plt.subplots()
-        ax_pg.plot(period, power)
-        ax_pg.set_xscale("log")
-        ax_pg.set_xlabel("Period (hr) [log]")
-        ax_pg.set_ylabel("LS power")
-        ax_pg.set_title("Exploratory LS periodogram (band-detrended mags)")
-
-        ax_pg.axvline(P_calc, linestyle="--", label="P_final")
-        ax_pg.axvline(0.5 * P_calc, linestyle=":", label="P/2")
-        ax_pg.axvline(2.0 * P_calc, linestyle=":", label="2P")
-
-        for i, p in enumerate(alias_periods, start=1):
-            ax_pg.axvline(p, linestyle="-.", linewidth=1, label=f"alias {i}: {p:.4f} h")
-
-        ax_pg.legend(fontsize=8)
-        st.pyplot(fig_pg, clear_figure=True)
-
-    if is_research:
-        st.markdown("## Research diagnostics")
-
-        def fold_quality_score(t_hr_in: np.ndarray, mag_in: np.ndarray, P_hr: float, nbins: int = 30) -> float:
-            if not np.isfinite(P_hr) or P_hr <= 0:
-                return np.nan
-            phase = (t_hr_in / P_hr) % 1.0
-            bins = np.linspace(0, 1, nbins + 1)
-            scatters = []
-            for i in range(nbins):
-                m = (phase >= bins[i]) & (phase < bins[i + 1])
-                if m.sum() < 5:
-                    continue
-                yb = mag_in[m]
-                med = np.nanmedian(yb)
-                mad = np.nanmedian(np.abs(yb - med))
-                scatters.append(1.4826 * mad)
-            if len(scatters) < 5:
-                return np.nan
-            s = float(np.nanmedian(scatters))
-            base = float(np.nanstd(mag_in))
-            if not np.isfinite(base) or base <= 0:
-                base = 0.1
-            ratio = s / base
-            score = 100 * max(0.0, 1.0 - ratio)
-            return float(np.clip(score, 0, 100))
-
-        st.markdown("### Bootstrap winner distribution")
-        if df_boot_quick is not None and {"P_hr", "wins", "frac"}.issubset(df_boot_quick.columns):
-            tmp = df_boot_quick.copy()
-            tmp["P_hr"] = pd.to_numeric(tmp["P_hr"], errors="coerce")
-            tmp["wins"] = pd.to_numeric(tmp["wins"], errors="coerce")
-            tmp["frac"] = pd.to_numeric(tmp["frac"], errors="coerce")
-            tmp = tmp.dropna(subset=["P_hr", "wins"]).sort_values("P_hr")
-
-            wins_int = tmp["wins"].fillna(0).astype(int).to_numpy()
-            samples = np.repeat(tmp["P_hr"].to_numpy(float), wins_int)
-
-            if samples.size == 0:
-                st.info("Bootstrap table found but contains no usable wins.")
-            else:
-                bins = st.slider("Histogram bins", min_value=10, max_value=120, value=40, key=f"bins_{selected}")
-
-                fig, ax = plt.subplots()
-                ax.hist(samples, bins=int(bins))
-                ax.set_xlabel("Winning period (hr)")
-                ax.set_ylabel("Count")
-                ax.set_title("Bootstrap winners histogram")
-                st.pyplot(fig, clear_figure=True)
-
-                st.caption("Top bootstrap winners")
-                st.dataframe(
-                    tmp.sort_values("wins", ascending=False).head(10)[["P_hr", "wins", "frac"]],
-                    use_container_width=True,
-                )
-        else:
-            st.info("No bootstrap winner table found for this object.")
-
-# ==========================
-# Pipeline Diagnostics (official outputs)
-# ==========================
-with tab_pipeline:
-    st.subheader("Pipeline diagnostics (official artifacts)")
-
-    obj_dir = _obj_dir(selected)
-    st.caption(f"Looking in: {obj_dir}")
-
-    st.markdown("### Official diagnostic images")
-    plots = [
-        ("periodogram.png", "Periodogram"),
-        ("fold_panel.png", "Fold comparison (P/2, P, 2P)"),
-        ("bootstrap.png", "Bootstrap summary"),
-        ("step13_folded_final.png", "Final folded LC (Step 13)"),
-        ("step13_residuals_vs_time.png", "Residuals vs time (Step 13)"),
-        ("step13_residual_hist.png", "Residual histogram (Step 13)"),
-    ]
-
-    found_any = False
-    for fname, title in plots:
-        p = obj_dir / fname
-        if p.exists():
-            found_any = True
-            st.image(str(p), caption=title, use_container_width=True)
-
-    if not found_any:
-        st.info("No official plot images found yet. Place PNGs in outputs/objects/<provid>/")
-
-    if is_research:
-        st.markdown("### Official tables (CSV if present)")
-
-        candidates_csv = obj_dir / "step11_fourier_validator.csv"
-        fam_csv = obj_dir / "step11_families.csv"
-        boot_winners_csv = obj_dir / "step12_bootstrap_winner_fractions.csv"
-        step13_summary_csv = obj_dir / "step13_final_summary.csv"
-
-        colA, colB = st.columns(2)
-
-        with colA:
-            df_cand = _read_csv_if_exists(candidates_csv)
-            if df_cand is not None and len(df_cand):
-                st.caption("Step 11: Candidate table (top 20 by BIC)")
-                show = df_cand.copy()
-                for c in ["P_hr", "BIC", "wrms", "K_best", "amp_ptp_mag"]:
-                    if c in show.columns:
-                        show[c] = _safe_num(show[c])
-                sort_by = [c for c in ["BIC", "wrms"] if c in show.columns]
-                if sort_by:
-                    show = show.sort_values(sort_by, ascending=[True] * len(sort_by))
-                show = show.head(20)
-                st.dataframe(show, use_container_width=True, height=280)
-                st.download_button(
-                    "Download Step 11 candidate table",
-                    df_cand.to_csv(index=False).encode("utf-8"),
-                    file_name=f"{selected}_step11_candidates.csv",
-                    mime="text/csv",
-                )
-            else:
-                st.info("No step11_fourier_validator.csv found for this object (optional).")
-
-            df_sum = _read_csv_if_exists(step13_summary_csv)
-            if df_sum is not None and len(df_sum):
-                st.caption("Step 13: Final summary row")
-                st.dataframe(df_sum, use_container_width=True)
-
-        with colB:
-            df_boot = _read_csv_if_exists(boot_winners_csv)
-            if df_boot is not None and len(df_boot):
-                st.caption("Step 12: Bootstrap winner fractions")
-                show = df_boot.copy()
-                for c in ["P_hr", "wins", "frac"]:
-                    if c in show.columns:
-                        show[c] = _safe_num(show[c])
-                if "frac" in show.columns:
-                    show = show.sort_values("frac", ascending=False)
-                st.dataframe(show, use_container_width=True, height=280)
-                st.download_button(
-                    "Download bootstrap winner fractions",
-                    df_boot.to_csv(index=False).encode("utf-8"),
-                    file_name=f"{selected}_bootstrap_winners.csv",
-                    mime="text/csv",
-                )
-            else:
-                st.info("No step12_bootstrap_winner_fractions.csv found for this object (optional).")
-
-            df_fam = _read_csv_if_exists(fam_csv)
-            if df_fam is not None and len(df_fam):
-                st.caption("Step 11: Family table")
-                st.dataframe(df_fam, use_container_width=True)
-            else:
-                st.info("No step11_families.csv found (optional). If you want it, write fam_df to CSV in Step 11.")
-    else:
-        st.info("Switch to **Research** mode to view official tables & downloads in this tab.")
-
-# --------------------------
-# Scoreboard (DISPLAY ONLY) - can be at bottom
-# --------------------------
-st.subheader("Scoreboard")
-
-st.dataframe(df_sorted[display_cols], use_container_width=True, height=380)
-
-st.download_button(
-    "Download current scoreboard (CSV)",
-    data=df_sorted[display_cols].to_csv(index=False).encode("utf-8"),
-    file_name="scoreboard_filtered.csv",
-    mime="text/csv",
-)
-
+    st.markdown("### Coming soon")
+    st.info(
+        "Periodogram, bootstrap histogram, candidate tables, and geometry-corrected folds will be enabled once "
+        "per-object pipeline outputs (Step 5/11/12) are included in the repo and linked by Designation."
+    )
