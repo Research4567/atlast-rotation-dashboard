@@ -1,10 +1,12 @@
 # app.py
 # ==========================================================
 # ATLAST Rotation Dashboard (Master-powered + Raw fold caveat)
-# - Tabs reordered: Object (default) -> Photometry -> Population (far right)
-# - Object summary presentation upgraded (clean KPI blocks + badges + sections)
-# - Fold plots still from raw bq-results.csv with caveat
-# - Periodogram / bootstrap histogram / candidate table: Coming soon
+# - Tabs reordered: Photometry -> Characterisation -> Population
+# - Removed Simple/Research toggle (since no behavioral difference)
+# - Sidebar reorganized:
+#     * Top: object selection + object-only controls (fold period explore)
+#     * Bottom: population filters (period range + N_obs range + reliability)
+# - Photometry tab is first (default) as requested
 # ==========================================================
 
 from __future__ import annotations
@@ -144,38 +146,69 @@ for c in NUM_COLS:
         master[c] = safe_num(master[c])
 
 # -------------------------
-# Header row: title + mode toggle
+# Header
 # -------------------------
-h1, h2 = st.columns([0.75, 0.25])
-with h1:
-    st.title("ATLAST Asteroid Rotation Dashboard")
-    st.caption("Master-powered population + object KPIs. Raw fold preview uses uncorrected Rubin First Look magnitudes (geometry-corrected validation coming soon).")
-with h2:
-    mode = st.radio(
-        "Mode",
-        ["Simple", "Research"],
-        horizontal=True,
-        label_visibility="collapsed",
-        key="ui_mode",
-    )
-is_research = (mode == "Research")
+st.title("ATLAST Asteroid Rotation Dashboard")
+st.caption(
+    "Photometry tab shows a raw fold preview from Rubin First Look photometry (no geometric corrections yet). "
+    "Characterisation + Population are master-file driven."
+)
 
 # -------------------------
-# Sidebar controls
+# Sidebar: OBJECT selection first (object controls)
 # -------------------------
-st.sidebar.header("Controls")
+st.sidebar.header("Object")
 
+# Reliability is a population filter, but also helps selecting objects; keep available below in Population section.
+q = st.sidebar.text_input("Search designation contains", value="", placeholder="e.g., 2025 MB17")
+
+# Start with a lightweight search list for selection (no population sliders yet)
+df_pick = master.copy()
+if q.strip():
+    df_pick = df_pick[df_pick["Designation"].astype(str).str.contains(q.strip(), case=False, na=False)]
+df_pick = df_pick.sort_values("Designation")
+
+designations = df_pick["Designation"].astype(str).tolist()
+if not designations:
+    st.warning("No objects match your search.")
+    st.stop()
+
+selected = st.sidebar.selectbox("Selected object", options=designations, index=0)
+
+row = master[master["Designation"].astype(str) == str(selected)]
+row = row.iloc[0].to_dict() if len(row) else {}
+
+P_adopt = float(row.get("Adopted period (hr)", np.nan))
+P_calc = P_adopt if (np.isfinite(P_adopt) and P_adopt > 0) else 5.0
+
+# Object-only fold control
+st.sidebar.subheader("Photometry fold controls")
+if np.isfinite(P_adopt) and P_adopt > 0:
+    pct = st.sidebar.slider("Explore ±% around adopted P", 0.0, 20.0, 5.0, 0.5)
+    lo = max(1e-6, P_adopt * (1.0 - pct / 100.0))
+    hi = P_adopt * (1.0 + pct / 100.0)
+    P_calc = st.sidebar.slider("Fold period (hr)", float(lo), float(hi), float(P_adopt))
+else:
+    P_calc = st.sidebar.number_input("Fold period (hr)", min_value=1e-6, value=float(P_calc))
+
+# -------------------------
+# Sidebar: POPULATION filters (below object sliders)
+# -------------------------
+st.sidebar.markdown("---")
+st.sidebar.header("Population filters")
+
+# Reliability
 rel_series = master.get("Reliability", pd.Series([], dtype=str)).dropna().astype(str)
 rel_options = sorted(rel_series.unique().tolist()) if len(rel_series) else ["reliable", "ambiguous", "insufficient", "unknown"]
 selected_rels = st.sidebar.multiselect("Reliability", options=rel_options, default=rel_options)
 
+# Adopted period range
 p_col = "Adopted period (hr)"
 if p_col in master.columns and master[p_col].notna().any():
     pmin = float(np.nanmin(master[p_col]))
     pmax = float(np.nanmax(master[p_col]))
 else:
     pmin, pmax = 0.0, 100.0
-
 p_lo, p_hi = st.sidebar.slider(
     "Adopted period range (hr)",
     min_value=float(max(0.0, pmin)),
@@ -183,13 +216,13 @@ p_lo, p_hi = st.sidebar.slider(
     value=(float(max(0.0, pmin)), float(max(1.0, pmax))),
 )
 
+# Number of observations range
 n_col = "Number of Observations"
 if n_col in master.columns and master[n_col].notna().any():
     nmin = int(np.nanmin(master[n_col]))
     nmax = int(np.nanmax(master[n_col]))
 else:
     nmin, nmax = 0, 1000
-
 n_lo, n_hi = st.sidebar.slider(
     "Number of observations",
     min_value=int(max(0, nmin)),
@@ -197,9 +230,7 @@ n_lo, n_hi = st.sidebar.slider(
     value=(int(max(0, nmin)), int(max(1, nmax))),
 )
 
-q = st.sidebar.text_input("Search designation contains", value="", placeholder="e.g., 2025 MB17")
-
-# Apply filters
+# Filtered population dataframe (used in Population tab)
 df_f = master.copy()
 if "Reliability" in df_f.columns:
     df_f = df_f[df_f["Reliability"].astype(str).isin(selected_rels)]
@@ -207,95 +238,19 @@ if p_col in df_f.columns:
     df_f = df_f[df_f[p_col].between(p_lo, p_hi, inclusive="both")]
 if n_col in df_f.columns:
     df_f = df_f[df_f[n_col].between(n_lo, n_hi, inclusive="both")]
-if q.strip():
-    df_f = df_f[df_f["Designation"].astype(str).str.contains(q.strip(), case=False, na=False)]
-
-df_f = df_f.sort_values(["Reliability", "Adopted period (hr)"] if ("Reliability" in df_f.columns and "Adopted period (hr)" in df_f.columns) else ["Designation"])
-st.sidebar.caption(f"{len(df_f):,} objects match filters")
-
-designations = df_f["Designation"].astype(str).tolist()
-if not designations:
-    st.warning("No objects match your filters.")
-    st.stop()
-
-selected = st.sidebar.selectbox("Selected object", options=designations, index=0)
-
-row = df_f[df_f["Designation"].astype(str) == str(selected)]
-row = row.iloc[0].to_dict() if len(row) else {}
-
-P_adopt = float(row.get("Adopted period (hr)", np.nan))
-P_calc = P_adopt
-
-# Always-visible fold slider (conservative range in Simple)
-if np.isfinite(P_adopt) and P_adopt > 0:
-    pct_default = 2.0 if not is_research else 5.0
-    pct = st.sidebar.slider("Fold period explore ±%", 0.0, 20.0, pct_default, 0.5)
-    lo = max(1e-6, P_adopt * (1.0 - pct / 100.0))
-    hi = P_adopt * (1.0 + pct / 100.0)
-    P_calc = st.sidebar.slider("Fold period (hr)", float(lo), float(hi), float(P_adopt))
-else:
-    P_calc = st.sidebar.number_input("Fold period (hr)", min_value=1e-6, value=5.0)
+st.sidebar.caption(f"{len(df_f):,} objects match population filters")
 
 # ==========================================================
-# Tabs (ORDER REQUESTED): Object -> Photometry -> Population (right)
+# Tabs: Photometry -> Characterisation -> Population
 # ==========================================================
-tab_obj, tab_photo, tab_pop = st.tabs(["Object", "Photometry (Raw Fold Preview)", "Population"])
-
-# ==========================================================
-# TAB: Object (default)
-# ==========================================================
-with tab_obj:
-    # Title row with small badges
-    top_l, top_r = st.columns([0.7, 0.3])
-    with top_l:
-        st.subheader(f"Object summary: {selected}")
-        st.caption("All values below come from master_results_clean.csv (your Step 13 exports).")
-    with top_r:
-        st.markdown(f"**Status:** {reliability_badge(str(row.get('Reliability', '')))}")
-        if np.isfinite(float(row.get("Bootstrap top_frac", np.nan))):
-            st.caption(f"Bootstrap top_frac: {format_float(row.get('Bootstrap top_frac', np.nan), 3)}")
-
-    # KPI grid (two rows)
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Adopted P (hr)", format_float(row.get("Adopted period (hr)", np.nan), 6))
-    k2.metric("LS peak P (hr)", format_float(row.get("LS peak period (hr)", np.nan), 6))
-    k3.metric("Adopted K", "—" if pd.isna(row.get("Adopted K", np.nan)) else str(int(row.get("Adopted K"))))
-    k4.metric("Amplitude (mag)", format_float(row.get("Amplitude (Fourier)", np.nan), 3))
-    k5.metric("Axial elongation", format_float(row.get("Axial Elongation", np.nan), 3))
-
-    b1, b2, b3, b4, b5 = st.columns(5)
-    b1.metric("N obs", "—" if pd.isna(row.get("Number of Observations", np.nan)) else str(int(row.get("Number of Observations"))))
-    b2.metric("Arc (days)", format_float(row.get("Arc (days)", np.nan), 3))
-    b3.metric("2P candidate (hr)", format_float(row.get("2P candidate (hr)", np.nan), 6))
-    b4.metric("ΔBIC(2P−P)", format_float(row.get("ΔBIC(2P−P)", np.nan), 3))
-    b5.metric("Mean r mag", format_float(row.get("Mean Mag (r Band)", np.nan), 3))
-
-    st.markdown("### Colors")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("g - r", format_float(row.get("g - r", np.nan), 4))
-    c2.metric("g - i", format_float(row.get("g - i", np.nan), 4))
-    c3.metric("r - i", format_float(row.get("r - i", np.nan), 4))
-
-    # Ambiguity string (only if Research)
-    if is_research:
-        st.markdown("### Ambiguity details (from bootstrap winners summary)")
-        amb = row.get("Ambiguous candidates (P_hr:frac)", "")
-        if isinstance(amb, str) and amb.strip() and amb.strip().lower() != "nan":
-            st.code(amb, language="text")
-        else:
-            st.caption("No ambiguous candidate string stored for this object.")
-
-    st.markdown("### Research diagnostics (coming soon)")
-    st.info(
-        "Periodogram, candidate BIC table, bootstrap histograms, and residual diagnostics will appear here once "
-        "per-object Step 11/12 outputs and geometry-corrected photometry are integrated into the dashboard."
-    )
+tab_photo, tab_char, tab_pop = st.tabs(["Photometry", "Characterisation", "Population"])
 
 # ==========================================================
 # TAB: Photometry (raw fold preview)
 # ==========================================================
 with tab_photo:
-    st.subheader("Raw fold preview (Rubin First Look photometry)")
+    st.subheader(f"Raw fold preview: {selected}")
+
     st.warning(
         "Caveat: These fold plots use RAW Rubin First Look magnitudes (no geometric corrections / phase-distance correction / "
         "band-centering yet). Geometry-corrected folds are coming soon and will replace this as the default validation view."
@@ -402,11 +357,50 @@ with tab_photo:
     )
 
 # ==========================================================
-# TAB: Population (far right)
+# TAB: Characterisation (master KPIs)
+# ==========================================================
+with tab_char:
+    st.subheader(f"Characterisation: {selected}")
+    st.caption("Values in this tab come from master_results_clean.csv (Step 13 exports).")
+
+    top_l, top_r = st.columns([0.7, 0.3])
+    with top_l:
+        st.markdown(f"**Status:** {reliability_badge(str(row.get('Reliability', '')))}")
+    with top_r:
+        tf = row.get("Bootstrap top_frac", np.nan)
+        st.markdown(f"**Bootstrap top_frac:** {format_float(tf, 3)}")
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Adopted P (hr)", format_float(row.get("Adopted period (hr)", np.nan), 6))
+    k2.metric("LS peak P (hr)", format_float(row.get("LS peak period (hr)", np.nan), 6))
+    k3.metric("Adopted K", "—" if pd.isna(row.get("Adopted K", np.nan)) else str(int(row.get("Adopted K"))))
+    k4.metric("Amplitude (mag)", format_float(row.get("Amplitude (Fourier)", np.nan), 3))
+    k5.metric("Axial elongation", format_float(row.get("Axial Elongation", np.nan), 3))
+
+    b1, b2, b3, b4, b5 = st.columns(5)
+    b1.metric("N obs", "—" if pd.isna(row.get("Number of Observations", np.nan)) else str(int(row.get("Number of Observations"))))
+    b2.metric("Arc (days)", format_float(row.get("Arc (days)", np.nan), 3))
+    b3.metric("2P candidate (hr)", format_float(row.get("2P candidate (hr)", np.nan), 6))
+    b4.metric("ΔBIC(2P−P)", format_float(row.get("ΔBIC(2P−P)", np.nan), 3))
+    b5.metric("Mean r mag", format_float(row.get("Mean Mag (r Band)", np.nan), 3))
+
+    st.markdown("### Colors")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("g - r", format_float(row.get("g - r", np.nan), 4))
+    c2.metric("g - i", format_float(row.get("g - i", np.nan), 4))
+    c3.metric("r - i", format_float(row.get("r - i", np.nan), 4))
+
+    st.markdown("### Coming soon (deep diagnostics)")
+    st.info(
+        "Candidate BIC table, bootstrap histograms, residual diagnostics, and geometry-corrected fold validation "
+        "will appear once per-object Step 11/12 outputs are integrated."
+    )
+
+# ==========================================================
+# TAB: Population (filtered)
 # ==========================================================
 with tab_pop:
-    st.subheader("Population overview (from master_results_clean.csv)")
-
+    st.subheader("Population overview (filtered by sidebar)")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Objects (filtered)", f"{len(df_f):,}")
     if "Reliability" in df_f.columns:
@@ -432,15 +426,14 @@ with tab_pop:
         ax.set_title("Period vs amplitude (filtered)")
         st.pyplot(fig, clear_figure=True)
 
-    # Histogram of adopted period
+    # Histogram
     if "Adopted period (hr)" in df_f.columns:
         st.markdown("### Adopted period distribution")
         periods = df_f["Adopted period (hr)"].to_numpy(float)
         periods = periods[np.isfinite(periods)]
-        bins = 60 if is_research else 40
 
         fig, ax = plt.subplots(figsize=(8.5, 4.0))
-        ax.hist(periods, bins=bins)
+        ax.hist(periods, bins=50)
         ax.set_xlabel("Adopted period (hr)")
         ax.set_ylabel("Count")
         ax.set_title("Adopted period histogram")
