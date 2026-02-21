@@ -1,13 +1,12 @@
 # app.py
 # ==========================================================
 # ATLAST Rotation Dashboard (Master-powered + Raw fold preview)
-# UPDATE (per request):
-# - Title Case for titles / section headers / axis labels
-# - Sidebar now includes RAW PLOT FILTERS that directly update the raw+folded plots:
-#     * Band filter (multi-select)
-#     * Optional magnitude range filter
-#     * Optional time window filter (hours since first obs)
-# - Photometry plots respond live to these filters
+# UPDATE (per latest request):
+# - Raw plot filters LIVE UNDER "Asteroid" section (not Population section)
+# - Remove Raw "Magnitude Range" filter
+# - Remove Raw "Time Window" filter
+# - Keep only Raw "Bands" filter + Fold Period controls under Asteroid
+# - Population section remains strictly population-only sliders/filters
 # ==========================================================
 
 from __future__ import annotations
@@ -101,7 +100,7 @@ def resolve_time_hours(df: pd.DataFrame) -> tuple[pd.Series, str]:
             t = pd.to_numeric(df[c], errors="coerce")
             if t.notna().sum() >= 3:
                 t0 = t.min()
-                return (t - t0) * 24.0, f"{c} (Hours Since First)".replace("_", " ").title()
+                return (t - t0) * 24.0, "Hours Since First Observation"
 
     jd_cands = ["jd", "JD", "obstime_jd", "obs_jd", "jd_mid", "jd_obs"]
     for c in jd_cands:
@@ -109,7 +108,7 @@ def resolve_time_hours(df: pd.DataFrame) -> tuple[pd.Series, str]:
             t = pd.to_numeric(df[c], errors="coerce")
             if t.notna().sum() >= 3:
                 t0 = t.min()
-                return (t - t0) * 24.0, f"{c} (Hours Since First)".replace("_", " ").title()
+                return (t - t0) * 24.0, "Hours Since First Observation"
 
     dt_cands = ["obstime", "obsTime", "obs_time", "datetime", "date", "time"]
     for c in dt_cands:
@@ -118,36 +117,36 @@ def resolve_time_hours(df: pd.DataFrame) -> tuple[pd.Series, str]:
             if dt.notna().sum() >= 3:
                 dt0 = dt.min()
                 t_hr = (dt - dt0).dt.total_seconds() / 3600.0
-                return t_hr, f"{c} (Hours Since First)".replace("_", " ").title()
+                return t_hr, "Hours Since First Observation"
 
     raise ValueError("No recognizable time column found (hours, MJD, JD, or datetime).")
 
-def resolve_nights(df: pd.DataFrame) -> tuple[int | None, str | None]:
+def resolve_nights(df: pd.DataFrame) -> int | None:
     for c in ["night", "night_id", "night_col", "nightNum", "nightnum"]:
         if c in df.columns:
             s = df[c].astype(str)
             if s.notna().sum() >= 3:
-                return int(s.nunique()), c
+                return int(s.nunique())
 
     for c in ["obstime", "obsTime", "obs_time", "datetime", "date", "time"]:
         if c in df.columns:
             dt = pd.to_datetime(df[c], errors="coerce", utc=True)
             if dt.notna().sum() >= 3:
-                return int(dt.dt.date.nunique()), f"Date({c})"
+                return int(dt.dt.date.nunique())
 
     for c in ["mjd", "MJD", "obstime_mjd", "mjd_obs", "midpointMjdTai", "midpointMjdUtc"]:
         if c in df.columns:
             t = pd.to_numeric(df[c], errors="coerce")
             if t.notna().sum() >= 3:
-                return int(np.floor(t).nunique()), f"Floor({c})"
+                return int(np.floor(t).nunique())
 
     for c in ["jd", "JD", "obstime_jd", "jd_obs"]:
         if c in df.columns:
             t = pd.to_numeric(df[c], errors="coerce")
             if t.notna().sum() >= 3:
-                return int(np.floor(t - 0.5).nunique()), f"Floor({c}-0.5)"
+                return int(np.floor(t - 0.5).nunique())
 
-    return None, None
+    return None
 
 def plot_fold(ax, t_hr: np.ndarray, mag: np.ndarray, bands: np.ndarray, P_hr: float, title: str, mag_label: str):
     phase = (t_hr / float(P_hr)) % 1.0
@@ -188,7 +187,7 @@ st.markdown("## ATLAST Asteroid Rotation Dashboard")
 st.caption("Photometry uses raw Rubin First Look magnitudes for fold previews. Geometry-corrected validation is coming soon.")
 
 # -------------------------
-# Sidebar: Asteroid selection
+# Sidebar: Asteroid selection + fold controls + raw band filter
 # -------------------------
 st.sidebar.markdown("## Asteroid")
 
@@ -208,20 +207,15 @@ selected = st.sidebar.selectbox("Selected Asteroid", options=designations, index
 
 row = master[master["Designation"].astype(str) == str(selected)]
 row = row.iloc[0].to_dict() if len(row) else {}
-
 rel = reliability_short(str(row.get("Reliability", "")))
 
 P_adopt = float(row.get("Adopted period (hr)", np.nan))
 if not (np.isfinite(P_adopt) and P_adopt > 0):
     P_adopt = 5.0
 
-# -------------------------
-# Sidebar: Photometry controls
-# -------------------------
 st.sidebar.markdown("---")
-st.sidebar.markdown("## Photometry Controls")
+st.sidebar.markdown("## Fold Controls")
 
-# Maintain fold period state
 if "fold_period" not in st.session_state or st.session_state.get("fold_period_for") != selected:
     st.session_state.fold_period = float(P_adopt)
     st.session_state.fold_period_for = selected
@@ -242,27 +236,24 @@ if st.sidebar.button("Reset To Adopted Period", use_container_width=True):
     st.session_state.fold_period = float(P_adopt)
     st.rerun()
 
-# Raw plot filters that affect BOTH raw + folded plots
-st.sidebar.markdown("### Raw Plot Filters")
+# Raw band filter stays in ASTEROID section (not population)
+st.sidebar.markdown("---")
+st.sidebar.markdown("## Raw Plot Filters")
 
-# Placeholders (filled after we load raw for this asteroid)
-# We'll store in session state so sidebar doesn't flicker badly
+# We'll fill this once we load df_o in Photometry tab; keep a placeholder UI state
 if "raw_band_filter" not in st.session_state:
     st.session_state.raw_band_filter = None
-if "raw_mag_range" not in st.session_state:
-    st.session_state.raw_mag_range = None
-if "raw_time_range" not in st.session_state:
-    st.session_state.raw_time_range = None
+if "raw_band_for" not in st.session_state:
+    st.session_state.raw_band_for = None
 
 # -------------------------
-# Sidebar: Population filters
+# Sidebar: Population filters (population only)
 # -------------------------
 st.sidebar.markdown("---")
 st.sidebar.markdown("## Population Filters")
 
 rel_series = master.get("Reliability", pd.Series([], dtype=str)).dropna().astype(str)
 rel_options = sorted(rel_series.unique().tolist()) if len(rel_series) else ["reliable", "ambiguous", "insufficient", "unknown"]
-
 selected_rels = st.sidebar.multiselect("Reliability", options=rel_options, default=rel_options)
 if not selected_rels:
     selected_rels = rel_options
@@ -321,12 +312,10 @@ with tab_photo:
 
     df_raw = load_raw_photometry(RAW_PHOTO_PATH)
 
-    # Band
     if "band" not in df_raw.columns:
         df_raw["band"] = "x"
     df_raw["band"] = df_raw["band"].astype(str).str.strip().str.lower()
 
-    # Object id match
     id_candidates = ["Designation", "designation", "provid", "PROVID", "object", "object_id", "ssobjectid", "ssObjectId"]
     obj_col = next((c for c in id_candidates if c in df_raw.columns), None)
     if obj_col is None:
@@ -354,7 +343,7 @@ with tab_photo:
             st.dataframe(df_o.head(30), use_container_width=True)
         st.stop()
 
-    # Mag column detection
+    # Magnitude column detection
     mag_col = None
     for cand in ["mag", "magnitude", "psfMag", "psfmag", "cModelMag", "mag_auto"]:
         if cand in df_o.columns:
@@ -371,21 +360,20 @@ with tab_photo:
         st.stop()
 
     df_o[mag_col] = pd.to_numeric(df_o[mag_col], errors="coerce")
+    df_o = df_o.dropna(subset=["t_hr", mag_col, "band"])
 
     # Nights
-    n_nights, nights_note = resolve_nights(df_o)
+    n_nights = resolve_nights(df_o)
 
-    # --- Populate sidebar raw filters now that we know bands/mag/time ---
+    # Band filter UI (now that we know available bands)
     all_bands = sorted([b for b in df_o["band"].dropna().astype(str).unique().tolist() if b.strip() != ""])
     if not all_bands:
         all_bands = ["x"]
 
-    # Init defaults per asteroid
-    if st.session_state.raw_band_filter is None or st.session_state.get("raw_band_for") != selected:
+    if st.session_state.raw_band_filter is None or st.session_state.raw_band_for != selected:
         st.session_state.raw_band_filter = all_bands
         st.session_state.raw_band_for = selected
 
-    # Band filter
     sel_bands = st.sidebar.multiselect(
         "Bands (Raw)",
         options=all_bands,
@@ -396,52 +384,9 @@ with tab_photo:
         sel_bands = all_bands
     st.session_state.raw_band_filter = sel_bands
 
-    # Magnitude range filter
-    mag_vals = df_o[mag_col].to_numpy(float)
-    mag_vals = mag_vals[np.isfinite(mag_vals)]
-    if len(mag_vals):
-        mag_min, mag_max = float(np.min(mag_vals)), float(np.max(mag_vals))
-        if st.session_state.raw_mag_range is None or st.session_state.get("raw_mag_for") != selected:
-            st.session_state.raw_mag_range = (mag_min, mag_max)
-            st.session_state.raw_mag_for = selected
+    dfp = df_o[df_o["band"].astype(str).isin(sel_bands)].copy()
 
-        mag_lo, mag_hi = st.sidebar.slider(
-            "Magnitude Range (Raw)",
-            min_value=float(mag_min),
-            max_value=float(mag_max),
-            value=(float(st.session_state.raw_mag_range[0]), float(st.session_state.raw_mag_range[1])),
-        )
-        st.session_state.raw_mag_range = (mag_lo, mag_hi)
-    else:
-        mag_lo, mag_hi = -np.inf, np.inf
-
-    # Time range filter
-    tvals = df_o["t_hr"].to_numpy(float)
-    tvals = tvals[np.isfinite(tvals)]
-    if len(tvals):
-        tmin, tmax = float(np.min(tvals)), float(np.max(tvals))
-        if st.session_state.raw_time_range is None or st.session_state.get("raw_time_for") != selected:
-            st.session_state.raw_time_range = (tmin, tmax)
-            st.session_state.raw_time_for = selected
-
-        t_lo, t_hi = st.sidebar.slider(
-            "Time Window (Hours Since First)",
-            min_value=float(tmin),
-            max_value=float(tmax),
-            value=(float(st.session_state.raw_time_range[0]), float(st.session_state.raw_time_range[1])),
-        )
-        st.session_state.raw_time_range = (t_lo, t_hi)
-    else:
-        t_lo, t_hi = -np.inf, np.inf
-
-    # Apply filters to raw data
-    dfp = df_o.copy()
-    dfp = dfp[dfp["band"].astype(str).isin(sel_bands)]
-    dfp = dfp[dfp[mag_col].between(mag_lo, mag_hi, inclusive="both")]
-    dfp = dfp[dfp["t_hr"].between(t_lo, t_hi, inclusive="both")]
-    dfp = dfp.dropna(subset=["t_hr", mag_col, "band"])
-
-    # Stats row (Title Case)
+    # Stats row
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("Adopted Period (Hr)", format_float(row.get("Adopted period (hr)", np.nan), 6))
     s2.metric("Fold Period (Hr)", format_float(P_calc, 6))
@@ -449,15 +394,11 @@ with tab_photo:
     s4.metric("Nights (Raw)", "—" if n_nights is None else str(int(n_nights)))
 
     if np.isfinite(float(arc_days)):
-        note = f"Arc Length (Days): {format_float(arc_days, 3)}"
-        if nights_note:
-            note += f" • Nights Computed From {nights_note}"
-        st.caption(note)
+        st.caption(f"Arc Length (Days): {format_float(arc_days, 3)}")
 
     if len(dfp) < 5:
-        st.warning("Very few points remain after filters. Try widening band/magnitude/time selections.")
+        st.warning("Very few points remain after the band filter. Try selecting more bands.")
 
-    # Arrays
     t_hr = dfp["t_hr"].to_numpy(float)
     mag = dfp[mag_col].to_numpy(float)
     bands = dfp["band"].to_numpy(str)
@@ -540,7 +481,6 @@ with tab_pop:
         c3.metric("Ambiguous", "—")
         c4.metric("Insufficient", "—")
 
-    # Period vs amplitude
     if "Adopted period (hr)" in df_f.columns and "Amplitude (Fourier)" in df_f.columns:
         st.markdown("#### Period vs Amplitude")
         x = df_f["Adopted period (hr)"].to_numpy(float)
@@ -556,7 +496,6 @@ with tab_pop:
             ax.set_title("Period vs Amplitude (Filtered)")
             st.pyplot(fig, clear_figure=True)
 
-    # Histogram
     if "Adopted period (hr)" in df_f.columns:
         st.markdown("#### Adopted Period Distribution")
         periods = df_f["Adopted period (hr)"].to_numpy(float)
