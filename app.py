@@ -1,11 +1,10 @@
 # app.py
 # ==========================================================
-# ATLAST Rotation Dashboard (Master-powered + GEOMETRY-CORRECTED fold preview)
-# UPDATE:
-# - Photometry now comes from BigQuery on demand (no RFL.csv)
-# - Runs Step 5 geometry correction on the fly for selected asteroid
-# - Folds and raw-vs-time plots use geometry-corrected mags (mag_geo_bandcenter by default)
-# - Queries ONLY the columns needed to minimize BigQuery cost
+# ATLAST Rotation Dashboard
+# - Master table from local CSV
+# - Photometry fetched ON DEMAND from BigQuery (only needed columns)
+# - Geometry correction computed ON THE FLY (JPL Horizons) inside THIS FILE
+# - Fold + mag-vs-time plots use geometry-corrected, band-centered magnitudes by default
 # ==========================================================
 
 from __future__ import annotations
@@ -17,15 +16,11 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# BigQuery client (requires google-cloud-bigquery in requirements)
 from google.cloud import bigquery
 
-# Step 5 function must be importable here.
-# If your Step 5 is in a separate file, do:
-# from lsst_functions import step5_geometry_horizons_range
-#
-# Otherwise, paste the function definition above this app.py.
-from step5_module import step5_geometry_horizons_range  # <-- CHANGE THIS IMPORT
+# Geometry correction deps (install via requirements.txt)
+from astropy.time import Time
+from astroquery.jplhorizons import Horizons
 
 
 # -------------------------
@@ -43,24 +38,250 @@ st.set_page_config(
 MASTER_PATH = Path("master_results_clean.csv")   # required
 
 # -------------------------
-# BigQuery config (EDIT THESE)
+# BigQuery config (EDIT IF NEEDED)
 # -------------------------
 BQ_PROJECT = "lsst-484623"
 BQ_DATASET = "asteroid_institute_mpc_replica"
 BQ_TABLE   = "public_obs_sbn"
+BQ_STN     = "X05"          # station filter to keep queries small
+BQ_ROW_LIMIT = 20000        # safety
 
-# Station filter (keeps query small)
-BQ_STN = "X05"
+# Horizons config
+HORIZONS_LOCATION = "X05"   # MPC code
+HG_G_DEFAULT = 0.15
 
-# Optional safety limit (should be plenty for one object)
-BQ_ROW_LIMIT = 20000
 
-# Horizons location should match station for correction
-HORIZONS_LOCATION = "X05"
+# ======================================================================
+# STEP 5 — Function: Geometry correction using JPL Horizons (range query)
+#   - Queries per-night blocks with START/STOP/STEP, then merge_asof to observations
+#   - Uses UTC JD consistently (obs UTC ↔ Horizons datetime_jd)
+#   - Uses night_id if available for blocks
+#
+# IMPORTANT for Streamlit:
+#   - In the app we call with save_tables=False and save_plots=False.
+#   - We also set FAIL_ON_UNMATCHED=False for better UX.
+# ======================================================================
+def step5_geometry_horizons_range(
+    df1: pd.DataFrame,
+    *,
+    PROVID: str,
+    OUTDIR: str,
+    HORIZONS_LOCATION: str = "X05",
+    G_DEFAULT: float = 0.15,
+    STEP_MINUTES: int = 1,
+    PAD_MINUTES: int = 5,
+    FAIL_ON_UNMATCHED: bool = True,
+    TOL_DAYS: float | None = None,   # if None, auto from STEP_MINUTES
+    show_plots: bool = False,
+    save_plots: bool = False,
+    save_tables: bool = False,
+    verbose: bool = False,
+):
+    def _p(*args, **kwargs):
+        if verbose:
+            print(*args, **kwargs)
+
+    if df1 is None or len(df1) == 0:
+        raise ValueError("STEP 5: df1 is empty.")
+
+    need = ["obstime_dt", "mag", "band"]
+    missing = [c for c in need if c not in df1.columns]
+    if missing:
+        raise ValueError(f"STEP 5: df1 missing columns required: {missing}")
+
+    if TOL_DAYS is None:
+        # 2e-3 days = 172.8 s
+        TOL_DAYS = max(2e-3, (STEP_MINUTES / 1440.0) * 1.2)
+
+    if save_tables or save_plots:
+        os.makedirs(OUTDIR, exist_ok=True)
+
+    dfG = df1.copy()
+    dfG["band"] = dfG["band"].astype(str).str.strip().str.lower()
+
+    # ensure utc datetime
+    dfG["obstime_dt"] = pd.to_datetime(dfG["obstime_dt"], errors="coerce", utc=True)
+    dfG = dfG.dropna(subset=["obstime_dt"]).sort_values("obstime_dt").reset_index(drop=True)
+
+    if len(dfG) == 0:
+        raise ValueError("STEP 5: all obstime_dt are NaT after coercion.")
+
+    # Default time axis for fitting (observation time)
+    if "t_hr" not in dfG.columns:
+        t0 = dfG["obstime_dt"].min()
+        dfG["t_hr"] = (dfG["obstime_dt"] - t0).dt.total_seconds() / 3600.0
+
+    # Night grouping key (use night_id if available)
+    if ("night_id" not in dfG.columns) and ("night_utc" not in dfG.columns):
+        dfG["night_utc"] = dfG["obstime_dt"].dt.strftime("%Y-%m-%d")
+    night_key = "night_id" if "night_id" in dfG.columns else "night_utc"
+
+    # Convert obs times to UTC JD to match Horizons datetime_jd
+    t_utc = Time(dfG["obstime_dt"].dt.to_pydatetime(), scale="utc")
+    dfG["jd_utc_obs"] = t_utc.jd.astype(float)
+
+    # -------------------------
+    # Horizons per-night range query
+    # -------------------------
+    def query_horizons_range_smallbody(desig, start_utc, stop_utc, step_minutes=1, location="X05"):
+        obj = Horizons(
+            id=desig,
+            id_type="smallbody",
+            location=location,
+            epochs={"start": start_utc, "stop": stop_utc, "step": f"{int(step_minutes)}m"},
+        )
+        eph = obj.ephemerides()
+        df = eph.to_pandas()
+
+        for k in ["datetime_jd", "r", "delta", "alpha", "lighttime"]:
+            if k not in df.columns:
+                raise KeyError(f"Horizons response missing '{k}'. Columns={list(df.columns)}")
+
+        return pd.DataFrame({
+            "jd_utc_eph": df["datetime_jd"].astype(float).to_numpy(),
+            "r_au": df["r"].astype(float).to_numpy(),
+            "delta_au": df["delta"].astype(float).to_numpy(),
+            "alpha_deg": df["alpha"].astype(float).to_numpy(),
+            "lighttime_min": df["lighttime"].astype(float).to_numpy(),
+        })
+
+    eph_parts = []
+    blocks = sorted(dfG[night_key].dropna().unique())
+
+    for block in blocks:
+        sub = dfG[dfG[night_key] == block]
+        tmin = pd.to_datetime(sub["obstime_dt"].min(), utc=True) - pd.Timedelta(minutes=PAD_MINUTES)
+        tmax = pd.to_datetime(sub["obstime_dt"].max(), utc=True) + pd.Timedelta(minutes=PAD_MINUTES)
+
+        start_utc = tmin.strftime("%Y-%m-%d %H:%M")
+        stop_utc  = tmax.strftime("%Y-%m-%d %H:%M")
+
+        eph_b = query_horizons_range_smallbody(
+            PROVID, start_utc, stop_utc,
+            step_minutes=STEP_MINUTES,
+            location=HORIZONS_LOCATION,
+        )
+        eph_parts.append(eph_b)
+
+    eph_df = (
+        pd.concat(eph_parts, ignore_index=True)
+          .drop_duplicates(subset=["jd_utc_eph"])
+          .sort_values("jd_utc_eph")
+          .reset_index(drop=True)
+    )
+
+    # -------------------------
+    # Merge (nearest) and QA dt
+    # -------------------------
+    obs = dfG.sort_values("jd_utc_obs").reset_index(drop=True)
+    eph = eph_df.sort_values("jd_utc_eph").reset_index(drop=True)
+
+    dfM = pd.merge_asof(
+        obs, eph,
+        left_on="jd_utc_obs",
+        right_on="jd_utc_eph",
+        direction="nearest",
+        tolerance=TOL_DAYS,
+    )
+
+    dfM["dt_match_sec"] = (dfM["jd_utc_obs"] - dfM["jd_utc_eph"]) * 86400.0
+
+    matched = int(dfM["r_au"].notna().sum())
+    n_total = int(len(dfM))
+    match_frac = matched / max(1, n_total)
+    n_unmatched = n_total - matched
+
+    if n_unmatched > 0 and FAIL_ON_UNMATCHED:
+        raise RuntimeError("Unmatched ephemeris rows remain after merge_asof.")
+
+    # -------------------------
+    # Light-time (keep for reference; DO NOT use as default fit axis)
+    # -------------------------
+    dfM["lighttime_days"] = dfM["lighttime_min"] / 1440.0
+    dfM["jd_utc_emit"] = dfM["jd_utc_obs"] - dfM["lighttime_days"]
+    t0_emit = float(np.nanmin(dfM["jd_utc_emit"].to_numpy(float)))
+    dfM["t_emit_hr"] = (dfM["jd_utc_emit"] - t0_emit) * 24.0
+
+    # -------------------------
+    # HG phase function (Bowell et al.)
+    # -------------------------
+    def phi1(alpha_rad):
+        return np.exp(-3.33 * np.power(np.tan(alpha_rad / 2.0), 0.63))
+
+    def phi2(alpha_rad):
+        return np.exp(-1.87 * np.power(np.tan(alpha_rad / 2.0), 1.22))
+
+    def phase_HG(alpha_deg, G=0.15):
+        a = np.deg2rad(alpha_deg)
+        p = (1.0 - G) * phi1(a) + G * phi2(a)
+        p = np.clip(p, 1e-12, None)
+        return -2.5 * np.log10(p)
+
+    # -------------------------
+    # Geometry-corrected magnitude
+    # -------------------------
+    r = pd.to_numeric(dfM["r_au"], errors="coerce").to_numpy(float)
+    d = pd.to_numeric(dfM["delta_au"], errors="coerce").to_numpy(float)
+    alpha = pd.to_numeric(dfM["alpha_deg"], errors="coerce").to_numpy(float)
+
+    dfM["dist_term"] = 5.0 * np.log10(r * d)
+    dfM["phase_term"] = phase_HG(alpha, G=G_DEFAULT)
+    dfM["mag_geo"] = pd.to_numeric(dfM["mag"], errors="coerce") - dfM["dist_term"] - dfM["phase_term"]
+
+    ok = np.isfinite(dfM["mag_geo"].to_numpy(float))
+    dfM["mag_geo_bandcenter"] = np.nan
+    if ok.any():
+        dfM.loc[ok, "mag_geo_bandcenter"] = (
+            dfM.loc[ok, "mag_geo"] - dfM.loc[ok].groupby("band")["mag_geo"].transform("median")
+        )
+
+    # Save outputs (usually off in-app)
+    out_geo = os.path.join(OUTDIR, "step5_geo_corrected.csv")
+    out_qa = os.path.join(OUTDIR, "step5_merge_qa.csv")
+
+    if save_tables:
+        dfM.to_csv(out_geo, index=False)
+        dfM[["obstime_dt", "jd_utc_obs", "jd_utc_eph", "dt_match_sec"]].to_csv(out_qa, index=False)
+
+    if save_plots or show_plots:
+        fig = plt.figure()
+        plt.scatter(dfM["t_hr"], dfM["mag"], s=10, label="mag")
+        plt.scatter(dfM["t_hr"], dfM["mag_geo"], s=10, label="mag_geo")
+        plt.scatter(dfM["t_hr"], dfM["mag_geo_bandcenter"], s=10, label="mag_geo_bandcenter")
+        plt.gca().invert_yaxis()
+        plt.xlabel("t_hr (hours)")
+        plt.ylabel("mag")
+        plt.title(f"{PROVID}: raw vs corrected drift (t_hr)")
+        plt.legend()
+        plt.tight_layout()
+        if save_plots:
+            plt.savefig(os.path.join(OUTDIR, "step5_drift_raw_vs_geo.png"), dpi=200)
+        if show_plots:
+            plt.show()
+        plt.close(fig)
+
+    step5_meta = {
+        "HORIZONS_LOCATION": str(HORIZONS_LOCATION),
+        "G_DEFAULT": float(G_DEFAULT),
+        "STEP_MINUTES": int(STEP_MINUTES),
+        "PAD_MINUTES": int(PAD_MINUTES),
+        "TOL_DAYS": float(TOL_DAYS),
+
+        "night_key": str(night_key),
+        "n_blocks": int(len(blocks)),
+        "n_obs": int(n_total),
+        "n_matched": int(matched),
+        "match_frac": float(match_frac),
+        "n_unmatched": int(n_unmatched),
+        "out_geo_csv": out_geo if save_tables else None,
+        "out_merge_qa_csv": out_qa if save_tables else None,
+    }
+
+    return dfM, step5_meta
 
 
 # -------------------------
-# Helpers
+# App helpers
 # -------------------------
 @st.cache_data(show_spinner=False)
 def load_master(path: Path) -> pd.DataFrame:
@@ -107,17 +328,15 @@ def norm_id(x) -> str:
     return s
 
 def resolve_nights(df: pd.DataFrame) -> int | None:
-    for c in ["night", "night_id", "night_col", "nightNum", "nightnum"]:
+    for c in ["night", "night_id", "night_utc"]:
         if c in df.columns:
             s = df[c].astype(str)
             if s.notna().sum() >= 3:
                 return int(s.nunique())
-
-    for c in ["obstime_dt", "obstime", "obsTime", "obs_time", "datetime", "date", "time"]:
-        if c in df.columns:
-            dt = pd.to_datetime(df[c], errors="coerce", utc=True)
-            if dt.notna().sum() >= 3:
-                return int(dt.dt.date.nunique())
+    if "obstime_dt" in df.columns:
+        dt = pd.to_datetime(df["obstime_dt"], errors="coerce", utc=True)
+        if dt.notna().sum() >= 3:
+            return int(dt.dt.date.nunique())
     return None
 
 def plot_fold(ax, t_hr: np.ndarray, mag: np.ndarray, bands: np.ndarray, P_hr: float, title: str, mag_label: str):
@@ -138,28 +357,23 @@ def plot_fold(ax, t_hr: np.ndarray, mag: np.ndarray, bands: np.ndarray, P_hr: fl
 # -------------------------
 @st.cache_resource
 def get_bq_client() -> bigquery.Client:
-    # On Streamlit Cloud, configure credentials via st.secrets and GOOGLE_APPLICATION_CREDENTIALS
     return bigquery.Client(project=BQ_PROJECT)
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def bq_load_photometry_for_provid(provid: str) -> pd.DataFrame:
     """
-    Minimal-column query for ONE asteroid.
-    Columns needed for Step 5 + plotting:
-      - obstime (timestamp)
-      - mag (float)
-      - rmsmag (float, optional weights)
-      - band (str)
-      - provid (id)
+    Query ONLY needed columns to minimize cost:
+      provid, obstime, band, mag, rmsmag
+    Filter:
+      stn = X05 and provid = selected and mag not null
     """
     client = get_bq_client()
-
     q = f"""
     SELECT
       provid,
       obstime,
       band,
-      SAFE_CAST(mag AS FLOAT64) AS mag,
+      SAFE_CAST(mag AS FLOAT64)    AS mag,
       SAFE_CAST(rmsmag AS FLOAT64) AS rmsmag
     FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`
     WHERE stn = @stn
@@ -168,36 +382,20 @@ def bq_load_photometry_for_provid(provid: str) -> pd.DataFrame:
     ORDER BY obstime
     LIMIT {int(BQ_ROW_LIMIT)}
     """
-
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("stn", "STRING", BQ_STN),
             bigquery.ScalarQueryParameter("prov", "STRING", provid),
         ]
     )
-    df = client.query(q, job_config=job_config).to_dataframe()
-    return df
+    return client.query(q, job_config=job_config).to_dataframe()
 
 def make_df1_from_bq(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert BigQuery photometry slice into df1 expected by Step 5:
-      obstime_dt (UTC datetime), mag, band, optional rmsmag, plus t_hr.
-    """
     df = df_raw.copy()
-
-    # Ensure expected columns
-    if "obstime" not in df.columns:
-        raise ValueError("BigQuery result missing 'obstime' column.")
-    if "mag" not in df.columns:
-        raise ValueError("BigQuery result missing 'mag' column.")
-    if "band" not in df.columns:
-        df["band"] = "x"
-
     df["obstime_dt"] = pd.to_datetime(df["obstime"], errors="coerce", utc=True)
     df["mag"] = pd.to_numeric(df["mag"], errors="coerce")
-    if "rmsmag" in df.columns:
-        df["rmsmag"] = pd.to_numeric(df["rmsmag"], errors="coerce")
-    df["band"] = df["band"].astype(str).str.strip().str.lower()
+    df["rmsmag"] = pd.to_numeric(df.get("rmsmag", np.nan), errors="coerce")
+    df["band"] = df.get("band", "x").astype(str).str.strip().str.lower()
 
     df = df.dropna(subset=["obstime_dt", "mag", "band"]).sort_values("obstime_dt").reset_index(drop=True)
     if len(df) == 0:
@@ -205,23 +403,25 @@ def make_df1_from_bq(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     t0 = df["obstime_dt"].min()
     df["t_hr"] = (df["obstime_dt"] - t0).dt.total_seconds() / 3600.0
+
+    # night_utc helps Step 5 block queries if night_id absent
+    df["night_utc"] = df["obstime_dt"].dt.strftime("%Y-%m-%d")
     return df
 
 @st.cache_data(show_spinner=False, ttl=24*3600)
 def geo_correct_cached(df1: pd.DataFrame, provid: str) -> tuple[pd.DataFrame, dict]:
-    """
-    Run Step 5 on-the-fly but do NOT write files.
-    Cache results so repeated asteroid selections are instant.
-    """
     df_geo, meta = step5_geometry_horizons_range(
         df1,
         PROVID=provid,
-        OUTDIR=".",  # unused when save_tables/save_plots False
+        OUTDIR=".",  # unused (save_tables=False)
         HORIZONS_LOCATION=HORIZONS_LOCATION,
+        G_DEFAULT=HG_G_DEFAULT,
+        STEP_MINUTES=1,
+        PAD_MINUTES=5,
+        FAIL_ON_UNMATCHED=False,
         save_tables=False,
         save_plots=False,
         show_plots=False,
-        FAIL_ON_UNMATCHED=False,
         verbose=False,
     )
     return df_geo, meta
@@ -247,19 +447,17 @@ for c in NUM_COLS:
     if c in master.columns:
         master[c] = safe_num(master[c])
 
-
 # -------------------------
 # Title
 # -------------------------
 st.markdown("## ATLAST Asteroid Rotation Dashboard")
-st.caption("Photometry is loaded from BigQuery per asteroid and folded using on-the-fly geometry correction (Horizons).")
+st.caption("Photometry is queried from BigQuery per asteroid and folded using on-the-fly geometry correction (Horizons).")
 
 
 # -------------------------
 # Sidebar: Asteroid selection
 # -------------------------
 st.sidebar.markdown("## Asteroid")
-
 q = st.sidebar.text_input("Search Designation", value="", placeholder="E.g., 2025 ME69")
 
 df_pick = master.copy()
@@ -309,14 +507,10 @@ if st.sidebar.button("Reset To Adopted Period", use_container_width=True):
     st.session_state.fold_period = float(P_adopt)
     st.rerun()
 
-# ---- Bands filter (keep UI / options) ----
+# Bands filter
 LSST_BANDS = ["u", "g", "r", "i", "z", "y"]
-
 if "raw_band_filter" not in st.session_state:
-    st.session_state.raw_band_filter = LSST_BANDS[:]  # default all
-if "raw_band_for" not in st.session_state:
-    st.session_state.raw_band_for = None
-
+    st.session_state.raw_band_filter = LSST_BANDS[:]
 sel_bands_sidebar = st.sidebar.multiselect(
     "Bands",
     options=LSST_BANDS,
@@ -389,45 +583,49 @@ with tab_photo:
     n_obs_master = row.get("Number of Observations", np.nan)
     arc_days = row.get("Arc (days)", np.nan)
 
-    # ---- Load from BigQuery ----
-    with st.spinner("Querying BigQuery photometry for this asteroid..."):
-        # If your master Designation is NOT exactly the BigQuery provid, change mapping here.
-        # For numbered objects, you can query permid instead (requires SQL changes).
+    with st.spinner("Querying BigQuery photometry (minimal columns) ..."):
         df_raw = bq_load_photometry_for_provid(str(selected))
 
     if df_raw is None or len(df_raw) == 0:
-        st.info("No photometry rows found in BigQuery for this asteroid (stn=X05).")
+        st.info("No photometry rows found in BigQuery for this asteroid (stn=X05, provid match).")
         st.stop()
 
     df1 = make_df1_from_bq(df_raw)
     if len(df1) < 5:
-        st.warning("Very few usable points after cleaning. Cannot fold reliably.")
+        st.warning("Very few usable points after cleaning.")
         st.dataframe(df1.head(50), use_container_width=True)
         st.stop()
 
-    # ---- Geometry correction on the fly ----
-    with st.spinner("Running on-the-fly geometry correction (Horizons)..."):
+    with st.spinner("Running geometry correction (Horizons) ..."):
         try:
             df_geo, meta5 = geo_correct_cached(df1, str(selected))
         except Exception as e:
-            st.error("Geometry correction failed (Horizons). Falling back to raw mags.")
+            st.error("Geometry correction failed (Horizons). Showing raw mags instead.")
             st.exception(e)
             df_geo = df1.copy()
-            df_geo["mag_geo_bandcenter"] = np.nan
             df_geo["mag_geo"] = np.nan
+            df_geo["mag_geo_bandcenter"] = np.nan
             meta5 = {}
 
-    # Choose corrected series (prefer band-centered)
-    mag_col = "mag_geo_bandcenter" if ("mag_geo_bandcenter" in df_geo.columns and df_geo["mag_geo_bandcenter"].notna().sum() >= 5) else "mag"
+    # Prefer corrected + band-centered if enough points
+    if "mag_geo_bandcenter" in df_geo.columns and df_geo["mag_geo_bandcenter"].notna().sum() >= 5:
+        mag_col = "mag_geo_bandcenter"
+        mag_label = "mag_geo_bandcenter (corrected, band-centered)"
+    elif "mag_geo" in df_geo.columns and df_geo["mag_geo"].notna().sum() >= 5:
+        mag_col = "mag_geo"
+        mag_label = "mag_geo (corrected)"
+    else:
+        mag_col = "mag"
+        mag_label = "mag (raw)"
 
-    # Apply band filter from sidebar (keep only selected LSST bands that exist)
+    # Apply band filter
     df_geo["band"] = df_geo["band"].astype(str).str.strip().str.lower()
-    avail_bands = set(df_geo["band"].unique().tolist())
-    sel_bands = [b for b in st.session_state.raw_band_filter if b in avail_bands]
+    avail = set(df_geo["band"].unique().tolist())
+    sel_bands = [b for b in st.session_state.raw_band_filter if b in avail]
     if not sel_bands:
-        sel_bands = sorted(list(avail_bands))
+        sel_bands = sorted(list(avail))
 
-    dfp = df_geo[df_geo["band"].astype(str).isin(sel_bands)].copy()
+    dfp = df_geo[df_geo["band"].isin(sel_bands)].copy()
     dfp = dfp.dropna(subset=["t_hr", mag_col, "band"])
 
     n_nights = resolve_nights(dfp)
@@ -442,26 +640,26 @@ with tab_photo:
     if np.isfinite(float(arc_days)):
         st.caption(f"Arc Length (Days): {format_float(arc_days, 3)}")
 
+    st.caption(f"Folding uses: **{mag_label}**")
+
     # Download corrected photometry for this object
     st.download_button(
-        "Download Geometry-Corrected Photometry (CSV)",
+        "Download Photometry (with geometry correction columns) CSV",
         data=df_geo.to_csv(index=False).encode("utf-8"),
-        file_name=f"{norm_id(selected)}_geo_corrected.csv",
+        file_name=f"{norm_id(selected)}_photometry_geo.csv",
         mime="text/csv",
         use_container_width=True,
     )
 
-    if mag_col == "mag":
-        st.warning("Using raw 'mag' for folding (mag_geo_bandcenter not available).")
-    else:
-        st.caption("Folding using geometry-corrected, band-centered magnitudes: mag_geo_bandcenter")
+    with st.expander("Geometry Correction QA (Step 5 meta)", expanded=False):
+        st.json(meta5)
 
     if len(dfp) < 5:
         st.warning("Very few points remain after band filtering. Try selecting more bands.")
         st.stop()
 
     t_hr = dfp["t_hr"].to_numpy(float)
-    mag = dfp[mag_col].to_numpy(float)
+    mag = pd.to_numeric(dfp[mag_col], errors="coerce").to_numpy(float)
     bands = dfp["band"].to_numpy(str)
 
     # 3-panel fold
@@ -476,26 +674,22 @@ with tab_photo:
     for col, P_hr, title in zip(cols, periods, titles):
         with col:
             fig, ax = plt.subplots(figsize=(5.2, 3.6))
-            plot_fold(ax, t_hr=t_hr, mag=mag, bands=bands, P_hr=P_hr, title=title, mag_label=mag_col)
+            plot_fold(ax, t_hr=t_hr, mag=mag, bands=bands, P_hr=P_hr, title=title, mag_label=mag_label)
             ax.legend(fontsize=7)
             st.pyplot(fig, clear_figure=True)
 
     # Magnitude vs Time (corrected)
-    st.markdown("#### Magnitude vs Time (Geometry-Corrected)")
+    st.markdown("#### Magnitude vs Time")
     fig, ax = plt.subplots(figsize=(10.5, 3.6))
     for b in sorted(np.unique(bands).tolist()):
         m = (bands == b)
         ax.scatter(t_hr[m], mag[m], s=10, label=b)
     ax.invert_yaxis()
     ax.set_xlabel("Hours Since First Observation")
-    ax.set_ylabel(mag_col)
+    ax.set_ylabel(mag_label)
     ax.set_title("Magnitude vs Time")
     ax.legend(fontsize=8, ncol=6)
     st.pyplot(fig, clear_figure=True)
-
-    # Optional: show Step 5 QA summary
-    with st.expander("Geometry Correction QA (Step 5 meta)", expanded=False):
-        st.json(meta5)
 
 
 # ==========================================================
