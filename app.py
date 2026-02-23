@@ -29,7 +29,7 @@ st.set_page_config(
 # Files (edit if paths differ)
 # -------------------------
 MASTER_PATH = Path("master_results_clean.csv")   # required
-RAW_PHOTO_PATH = Path("bq-results.csv")          # optional (raw Rubin First Look photometry)
+RAW_PHOTO_PATH = Path("RFL.csv")          # optional (raw Rubin First Look photometry)
 
 # -------------------------
 # Helpers
@@ -341,7 +341,7 @@ with tab_photo:
     df_o = df_raw[s_norm == target].copy()
 
     if len(df_o) == 0:
-        st.info("No raw photometry rows found for this asteroid in bq-results.csv.")
+        st.info("No raw photometry rows found for this asteroid in RLF.csv.")
         st.stop()
 
     # Time → hours
@@ -529,3 +529,4 @@ with tab_pop:
         mime="text/csv",
         use_container_width=True,
     )
+
