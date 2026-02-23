@@ -1,20 +1,32 @@
 # app.py
 # ==========================================================
-# ATLAST Rotation Dashboard (Master-powered + Raw fold preview)
-# UPDATE (per request):
-# - Move "Bands (Raw)" filter directly under Fold Controls
-# - Remove the "Raw Plot Filters" header text AND its divider line
-# - Ensure LSST band options are always present (g, r, i, z, y, u)
-#   even if a band isn't present for the selected asteroid
+# ATLAST Rotation Dashboard (Master-powered + GEOMETRY-CORRECTED fold preview)
+# UPDATE:
+# - Photometry now comes from BigQuery on demand (no RFL.csv)
+# - Runs Step 5 geometry correction on the fly for selected asteroid
+# - Folds and raw-vs-time plots use geometry-corrected mags (mag_geo_bandcenter by default)
+# - Queries ONLY the columns needed to minimize BigQuery cost
 # ==========================================================
 
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+
+# BigQuery client (requires google-cloud-bigquery in requirements)
+from google.cloud import bigquery
+
+# Step 5 function must be importable here.
+# If your Step 5 is in a separate file, do:
+# from lsst_functions import step5_geometry_horizons_range
+#
+# Otherwise, paste the function definition above this app.py.
+from step5_module import step5_geometry_horizons_range  # <-- CHANGE THIS IMPORT
+
 
 # -------------------------
 # Page config
@@ -26,10 +38,26 @@ st.set_page_config(
 )
 
 # -------------------------
-# Files (edit if paths differ)
+# Local file(s)
 # -------------------------
 MASTER_PATH = Path("master_results_clean.csv")   # required
-RAW_PHOTO_PATH = Path("RFL.csv")          # optional (raw Rubin First Look photometry)
+
+# -------------------------
+# BigQuery config (EDIT THESE)
+# -------------------------
+BQ_PROJECT = "lsst-484623"
+BQ_DATASET = "asteroid_institute_mpc_replica"
+BQ_TABLE   = "public_obs_sbn"
+
+# Station filter (keeps query small)
+BQ_STN = "X05"
+
+# Optional safety limit (should be plenty for one object)
+BQ_ROW_LIMIT = 20000
+
+# Horizons location should match station for correction
+HORIZONS_LOCATION = "X05"
+
 
 # -------------------------
 # Helpers
@@ -43,10 +71,6 @@ def load_master(path: Path) -> pd.DataFrame:
                 df = df.rename(columns={c: "Designation"})
                 break
     return df
-
-@st.cache_data(show_spinner=False)
-def load_raw_photometry(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path)
 
 def safe_num(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
@@ -82,44 +106,6 @@ def norm_id(x) -> str:
         s = s.replace(ch, "")
     return s
 
-def resolve_time_hours(df: pd.DataFrame) -> tuple[pd.Series, str]:
-    hour_cands = ["t_hr", "t_hours", "time_hr", "time_hours", "tHours", "timeHours"]
-    for c in hour_cands:
-        if c in df.columns:
-            t = pd.to_numeric(df[c], errors="coerce")
-            if t.notna().sum() >= 3:
-                return t, c.replace("_", " ").title()
-
-    mjd_cands = [
-        "mjd", "MJD", "obstime_mjd", "obs_mjd", "mjd_mid", "mjd_obs",
-        "mjd_tai", "mjd_utc", "midpointMjdTai", "midpointMjdUtc"
-    ]
-    for c in mjd_cands:
-        if c in df.columns:
-            t = pd.to_numeric(df[c], errors="coerce")
-            if t.notna().sum() >= 3:
-                t0 = t.min()
-                return (t - t0) * 24.0, "Hours Since First Observation"
-
-    jd_cands = ["jd", "JD", "obstime_jd", "obs_jd", "jd_mid", "jd_obs"]
-    for c in jd_cands:
-        if c in df.columns:
-            t = pd.to_numeric(df[c], errors="coerce")
-            if t.notna().sum() >= 3:
-                t0 = t.min()
-                return (t - t0) * 24.0, "Hours Since First Observation"
-
-    dt_cands = ["obstime", "obsTime", "obs_time", "datetime", "date", "time"]
-    for c in dt_cands:
-        if c in df.columns:
-            dt = pd.to_datetime(df[c], errors="coerce", utc=True)
-            if dt.notna().sum() >= 3:
-                dt0 = dt.min()
-                t_hr = (dt - dt0).dt.total_seconds() / 3600.0
-                return t_hr, "Hours Since First Observation"
-
-    raise ValueError("No recognizable time column found (hours, MJD, JD, or datetime).")
-
 def resolve_nights(df: pd.DataFrame) -> int | None:
     for c in ["night", "night_id", "night_col", "nightNum", "nightnum"]:
         if c in df.columns:
@@ -127,24 +113,11 @@ def resolve_nights(df: pd.DataFrame) -> int | None:
             if s.notna().sum() >= 3:
                 return int(s.nunique())
 
-    for c in ["obstime", "obsTime", "obs_time", "datetime", "date", "time"]:
+    for c in ["obstime_dt", "obstime", "obsTime", "obs_time", "datetime", "date", "time"]:
         if c in df.columns:
             dt = pd.to_datetime(df[c], errors="coerce", utc=True)
             if dt.notna().sum() >= 3:
                 return int(dt.dt.date.nunique())
-
-    for c in ["mjd", "MJD", "obstime_mjd", "mjd_obs", "midpointMjdTai", "midpointMjdUtc"]:
-        if c in df.columns:
-            t = pd.to_numeric(df[c], errors="coerce")
-            if t.notna().sum() >= 3:
-                return int(np.floor(t).nunique())
-
-    for c in ["jd", "JD", "obstime_jd", "jd_obs"]:
-        if c in df.columns:
-            t = pd.to_numeric(df[c], errors="coerce")
-            if t.notna().sum() >= 3:
-                return int(np.floor(t - 0.5).nunique())
-
     return None
 
 def plot_fold(ax, t_hr: np.ndarray, mag: np.ndarray, bands: np.ndarray, P_hr: float, title: str, mag_label: str):
@@ -158,6 +131,101 @@ def plot_fold(ax, t_hr: np.ndarray, mag: np.ndarray, bands: np.ndarray, P_hr: fl
     ax.set_xlabel("Phase")
     ax.set_ylabel(mag_label)
     ax.set_title(title)
+
+
+# -------------------------
+# BigQuery access (cached)
+# -------------------------
+@st.cache_resource
+def get_bq_client() -> bigquery.Client:
+    # On Streamlit Cloud, configure credentials via st.secrets and GOOGLE_APPLICATION_CREDENTIALS
+    return bigquery.Client(project=BQ_PROJECT)
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def bq_load_photometry_for_provid(provid: str) -> pd.DataFrame:
+    """
+    Minimal-column query for ONE asteroid.
+    Columns needed for Step 5 + plotting:
+      - obstime (timestamp)
+      - mag (float)
+      - rmsmag (float, optional weights)
+      - band (str)
+      - provid (id)
+    """
+    client = get_bq_client()
+
+    q = f"""
+    SELECT
+      provid,
+      obstime,
+      band,
+      SAFE_CAST(mag AS FLOAT64) AS mag,
+      SAFE_CAST(rmsmag AS FLOAT64) AS rmsmag
+    FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`
+    WHERE stn = @stn
+      AND provid = @prov
+      AND SAFE_CAST(mag AS FLOAT64) IS NOT NULL
+    ORDER BY obstime
+    LIMIT {int(BQ_ROW_LIMIT)}
+    """
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("stn", "STRING", BQ_STN),
+            bigquery.ScalarQueryParameter("prov", "STRING", provid),
+        ]
+    )
+    df = client.query(q, job_config=job_config).to_dataframe()
+    return df
+
+def make_df1_from_bq(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert BigQuery photometry slice into df1 expected by Step 5:
+      obstime_dt (UTC datetime), mag, band, optional rmsmag, plus t_hr.
+    """
+    df = df_raw.copy()
+
+    # Ensure expected columns
+    if "obstime" not in df.columns:
+        raise ValueError("BigQuery result missing 'obstime' column.")
+    if "mag" not in df.columns:
+        raise ValueError("BigQuery result missing 'mag' column.")
+    if "band" not in df.columns:
+        df["band"] = "x"
+
+    df["obstime_dt"] = pd.to_datetime(df["obstime"], errors="coerce", utc=True)
+    df["mag"] = pd.to_numeric(df["mag"], errors="coerce")
+    if "rmsmag" in df.columns:
+        df["rmsmag"] = pd.to_numeric(df["rmsmag"], errors="coerce")
+    df["band"] = df["band"].astype(str).str.strip().str.lower()
+
+    df = df.dropna(subset=["obstime_dt", "mag", "band"]).sort_values("obstime_dt").reset_index(drop=True)
+    if len(df) == 0:
+        return df
+
+    t0 = df["obstime_dt"].min()
+    df["t_hr"] = (df["obstime_dt"] - t0).dt.total_seconds() / 3600.0
+    return df
+
+@st.cache_data(show_spinner=False, ttl=24*3600)
+def geo_correct_cached(df1: pd.DataFrame, provid: str) -> tuple[pd.DataFrame, dict]:
+    """
+    Run Step 5 on-the-fly but do NOT write files.
+    Cache results so repeated asteroid selections are instant.
+    """
+    df_geo, meta = step5_geometry_horizons_range(
+        df1,
+        PROVID=provid,
+        OUTDIR=".",  # unused when save_tables/save_plots False
+        HORIZONS_LOCATION=HORIZONS_LOCATION,
+        save_tables=False,
+        save_plots=False,
+        show_plots=False,
+        FAIL_ON_UNMATCHED=False,
+        verbose=False,
+    )
+    return df_geo, meta
+
 
 # -------------------------
 # Load master
@@ -179,11 +247,13 @@ for c in NUM_COLS:
     if c in master.columns:
         master[c] = safe_num(master[c])
 
+
 # -------------------------
 # Title
 # -------------------------
 st.markdown("## ATLAST Asteroid Rotation Dashboard")
-st.caption("Photometry uses raw Rubin First Look magnitudes for fold previews. Geometry-corrected validation is coming soon.")
+st.caption("Photometry is loaded from BigQuery per asteroid and folded using on-the-fly geometry correction (Horizons).")
+
 
 # -------------------------
 # Sidebar: Asteroid selection
@@ -212,6 +282,7 @@ P_adopt = float(row.get("Adopted period (hr)", np.nan))
 if not (np.isfinite(P_adopt) and P_adopt > 0):
     P_adopt = 5.0
 
+
 # -------------------------
 # Sidebar: Fold controls
 # -------------------------
@@ -238,8 +309,7 @@ if st.sidebar.button("Reset To Adopted Period", use_container_width=True):
     st.session_state.fold_period = float(P_adopt)
     st.rerun()
 
-# ---- Bands filter directly under fold controls (requested) ----
-# Ensure LSST band options always exist in the UI
+# ---- Bands filter (keep UI / options) ----
 LSST_BANDS = ["u", "g", "r", "i", "z", "y"]
 
 if "raw_band_filter" not in st.session_state:
@@ -247,10 +317,8 @@ if "raw_band_filter" not in st.session_state:
 if "raw_band_for" not in st.session_state:
     st.session_state.raw_band_for = None
 
-# We'll refine the default bands per asteroid AFTER loading raw data in Photometry tab.
-# But the UI stays here under Fold Controls.
 sel_bands_sidebar = st.sidebar.multiselect(
-    "Bands (Raw)",
+    "Bands",
     options=LSST_BANDS,
     default=st.session_state.raw_band_filter if isinstance(st.session_state.raw_band_filter, list) else LSST_BANDS,
     key="raw_band_widget",
@@ -259,8 +327,9 @@ if not sel_bands_sidebar:
     sel_bands_sidebar = LSST_BANDS
 st.session_state.raw_band_filter = sel_bands_sidebar
 
+
 # -------------------------
-# Sidebar: Population filters
+# Sidebar: Population filters (unchanged)
 # -------------------------
 st.sidebar.markdown("---")
 st.sidebar.markdown("## Population Filters")
@@ -301,100 +370,95 @@ if n_col in df_f.columns:
 
 st.sidebar.caption(f"{len(df_f):,} Asteroids Match Filters")
 
+
 # -------------------------
 # Tabs
 # -------------------------
 tab_photo, tab_char, tab_pop = st.tabs(["Photometry", "Characterisation", "Population"])
 
+
 # ==========================================================
-# Photometry Tab
+# Photometry Tab (BigQuery + Step 5 on the fly)
 # ==========================================================
 with tab_photo:
     st.markdown(
-        f"### Raw Fold Preview: **{selected}** &nbsp;&nbsp;•&nbsp;&nbsp; {reliability_html(rel)}",
+        f"### Geometry-Corrected Fold Preview: **{selected}** &nbsp;&nbsp;•&nbsp;&nbsp; {reliability_html(rel)}",
         unsafe_allow_html=True,
     )
 
     n_obs_master = row.get("Number of Observations", np.nan)
     arc_days = row.get("Arc (days)", np.nan)
 
-    if not RAW_PHOTO_PATH.exists():
-        st.error(f"Raw photometry file not found: {RAW_PHOTO_PATH}")
+    # ---- Load from BigQuery ----
+    with st.spinner("Querying BigQuery photometry for this asteroid..."):
+        # If your master Designation is NOT exactly the BigQuery provid, change mapping here.
+        # For numbered objects, you can query permid instead (requires SQL changes).
+        df_raw = bq_load_photometry_for_provid(str(selected))
+
+    if df_raw is None or len(df_raw) == 0:
+        st.info("No photometry rows found in BigQuery for this asteroid (stn=X05).")
         st.stop()
 
-    df_raw = load_raw_photometry(RAW_PHOTO_PATH)
-
-    if "band" not in df_raw.columns:
-        df_raw["band"] = "x"
-    df_raw["band"] = df_raw["band"].astype(str).str.strip().str.lower()
-
-    id_candidates = ["Designation", "designation", "provid", "PROVID", "object", "object_id", "ssobjectid", "ssObjectId"]
-    obj_col = next((c for c in id_candidates if c in df_raw.columns), None)
-    if obj_col is None:
-        st.error("Could not find an object identifier column in bq-results.csv (e.g., Designation/provid/ssObjectId).")
-        with st.expander("Debug: Show Columns"):
-            st.write(list(df_raw.columns))
+    df1 = make_df1_from_bq(df_raw)
+    if len(df1) < 5:
+        st.warning("Very few usable points after cleaning. Cannot fold reliably.")
+        st.dataframe(df1.head(50), use_container_width=True)
         st.stop()
 
-    target = norm_id(selected)
-    s_norm = df_raw[obj_col].map(norm_id)
-    df_o = df_raw[s_norm == target].copy()
+    # ---- Geometry correction on the fly ----
+    with st.spinner("Running on-the-fly geometry correction (Horizons)..."):
+        try:
+            df_geo, meta5 = geo_correct_cached(df1, str(selected))
+        except Exception as e:
+            st.error("Geometry correction failed (Horizons). Falling back to raw mags.")
+            st.exception(e)
+            df_geo = df1.copy()
+            df_geo["mag_geo_bandcenter"] = np.nan
+            df_geo["mag_geo"] = np.nan
+            meta5 = {}
 
-    if len(df_o) == 0:
-        st.info("No raw photometry rows found for this asteroid in RLF.csv.")
-        st.stop()
-
-    # Time → hours
-    try:
-        t_hr_series, time_label = resolve_time_hours(df_o)
-        df_o["t_hr"] = pd.to_numeric(t_hr_series, errors="coerce")
-    except Exception as e:
-        st.error(str(e))
-        with st.expander("Debug: Show Columns"):
-            st.write(list(df_o.columns))
-            st.dataframe(df_o.head(30), use_container_width=True)
-        st.stop()
-
-    # Magnitude column detection
-    mag_col = None
-    for cand in ["mag", "magnitude", "psfMag", "psfmag", "cModelMag", "mag_auto"]:
-        if cand in df_o.columns:
-            mag_col = cand
-            break
-    if mag_col is None:
-        mag_like = [c for c in df_o.columns if "mag" in c.lower()]
-        if mag_like:
-            mag_col = mag_like[0]
-    if mag_col is None:
-        st.error("Could not find a magnitude column in raw photometry (expected 'mag' or similar).")
-        with st.expander("Debug: Show Columns"):
-            st.write(list(df_o.columns))
-        st.stop()
-
-    df_o[mag_col] = pd.to_numeric(df_o[mag_col], errors="coerce")
-    df_o = df_o.dropna(subset=["t_hr", mag_col, "band"])
-
-    n_nights = resolve_nights(df_o)
+    # Choose corrected series (prefer band-centered)
+    mag_col = "mag_geo_bandcenter" if ("mag_geo_bandcenter" in df_geo.columns and df_geo["mag_geo_bandcenter"].notna().sum() >= 5) else "mag"
 
     # Apply band filter from sidebar (keep only selected LSST bands that exist)
-    sel_bands = [b for b in st.session_state.raw_band_filter if b in set(df_o["band"].unique())]  # filter to available
+    df_geo["band"] = df_geo["band"].astype(str).str.strip().str.lower()
+    avail_bands = set(df_geo["band"].unique().tolist())
+    sel_bands = [b for b in st.session_state.raw_band_filter if b in avail_bands]
     if not sel_bands:
-        sel_bands = sorted(df_o["band"].unique().tolist())
+        sel_bands = sorted(list(avail_bands))
 
-    dfp = df_o[df_o["band"].astype(str).isin(sel_bands)].copy()
+    dfp = df_geo[df_geo["band"].astype(str).isin(sel_bands)].copy()
+    dfp = dfp.dropna(subset=["t_hr", mag_col, "band"])
+
+    n_nights = resolve_nights(dfp)
 
     # Stats row
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("Adopted Period (Hr)", format_float(row.get("Adopted period (hr)", np.nan), 6))
     s2.metric("Fold Period (Hr)", format_float(P_calc, 6))
-    s3.metric("Observations (N)", "—" if pd.isna(n_obs_master) else str(int(n_obs_master)))
-    s4.metric("Nights (Raw)", "—" if n_nights is None else str(int(n_nights)))
+    s3.metric("Observations (Master)", "—" if pd.isna(n_obs_master) else str(int(n_obs_master)))
+    s4.metric("Nights (Photometry)", "—" if n_nights is None else str(int(n_nights)))
 
     if np.isfinite(float(arc_days)):
         st.caption(f"Arc Length (Days): {format_float(arc_days, 3)}")
 
+    # Download corrected photometry for this object
+    st.download_button(
+        "Download Geometry-Corrected Photometry (CSV)",
+        data=df_geo.to_csv(index=False).encode("utf-8"),
+        file_name=f"{norm_id(selected)}_geo_corrected.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    if mag_col == "mag":
+        st.warning("Using raw 'mag' for folding (mag_geo_bandcenter not available).")
+    else:
+        st.caption("Folding using geometry-corrected, band-centered magnitudes: mag_geo_bandcenter")
+
     if len(dfp) < 5:
-        st.warning("Very few points remain after the band filter. Try selecting more bands.")
+        st.warning("Very few points remain after band filtering. Try selecting more bands.")
+        st.stop()
 
     t_hr = dfp["t_hr"].to_numpy(float)
     mag = dfp[mag_col].to_numpy(float)
@@ -412,31 +476,37 @@ with tab_photo:
     for col, P_hr, title in zip(cols, periods, titles):
         with col:
             fig, ax = plt.subplots(figsize=(5.2, 3.6))
-            plot_fold(ax, t_hr=t_hr, mag=mag, bands=bands, P_hr=P_hr, title=title, mag_label=mag_col.replace("_", " ").title())
+            plot_fold(ax, t_hr=t_hr, mag=mag, bands=bands, P_hr=P_hr, title=title, mag_label=mag_col)
             ax.legend(fontsize=7)
             st.pyplot(fig, clear_figure=True)
 
-    st.markdown("#### Raw Magnitude vs Time")
+    # Magnitude vs Time (corrected)
+    st.markdown("#### Magnitude vs Time (Geometry-Corrected)")
     fig, ax = plt.subplots(figsize=(10.5, 3.6))
     for b in sorted(np.unique(bands).tolist()):
         m = (bands == b)
         ax.scatter(t_hr[m], mag[m], s=10, label=b)
     ax.invert_yaxis()
-    ax.set_xlabel(time_label)
-    ax.set_ylabel(mag_col.replace("_", " ").title())
-    ax.set_title("Raw Magnitude vs Time")
+    ax.set_xlabel("Hours Since First Observation")
+    ax.set_ylabel(mag_col)
+    ax.set_title("Magnitude vs Time")
     ax.legend(fontsize=8, ncol=6)
     st.pyplot(fig, clear_figure=True)
 
+    # Optional: show Step 5 QA summary
+    with st.expander("Geometry Correction QA (Step 5 meta)", expanded=False):
+        st.json(meta5)
+
+
 # ==========================================================
-# Characterisation Tab
+# Characterisation Tab (unchanged)
 # ==========================================================
 with tab_char:
     st.markdown(
         f"### Characterisation: **{selected}** &nbsp;&nbsp;•&nbsp;&nbsp; {reliability_html(rel)}",
         unsafe_allow_html=True,
     )
-    st.caption("All values on this tab come from Master_Results_Clean.csv (Step 13 Summary Exports).")
+    st.caption("All values on this tab come from master_results_clean.csv (Step 13 Summary Exports).")
 
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Adopted Period (Hr)", format_float(row.get("Adopted period (hr)", np.nan), 6))
@@ -458,8 +528,9 @@ with tab_char:
     c2.metric("g − i", format_float(row.get("g - i", np.nan), 4))
     c3.metric("r − i", format_float(row.get("r - i", np.nan), 4))
 
+
 # ==========================================================
-# Population Tab
+# Population Tab (unchanged)
 # ==========================================================
 with tab_pop:
     st.markdown("### Population Overview (Filtered)")
@@ -529,4 +600,3 @@ with tab_pop:
         mime="text/csv",
         use_container_width=True,
     )
-
