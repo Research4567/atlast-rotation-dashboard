@@ -34,7 +34,7 @@ MASTER_PATH = Path("master_results_clean.csv")  # required
 # BigQuery config
 # -------------------------
 BQ_PROJECT = "lsst-484623"
-BQ_DATASET = "asteroid_institute___mpc_replica_views"   # MV dataset
+BQ_DATASET = "asteroid_institute__mpc_replica_views"   # MV dataset
 BQ_TABLE   = "public_obs_sbn_clustered"               # MV name
 BQ_STN     = "X05"
 BQ_ROW_LIMIT = 20000
@@ -841,4 +841,5 @@ else:
         mime="text/csv",
         use_container_width=True,
     )
+
 
