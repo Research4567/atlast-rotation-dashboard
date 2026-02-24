@@ -1,36 +1,22 @@
 # -------------------------
-# BigQuery config
+# BigQuery (Streamlit Cloud safe) — compatible caching
 # -------------------------
-BQ_PROJECT = "lsst-484623"
-BQ_DATASET = "asteroid_institute_mpc_replica_views"   # <- MV dataset
-BQ_TABLE   = "public_obs_sbn_clustered"               # <- MV name
-BQ_STN     = "X05"
-BQ_ROW_LIMIT = 20000
+# Some Streamlit Cloud environments are on older Streamlit versions.
+# Use cache_resource/cache_data if available; otherwise fall back.
 
-# BigQuery on-demand analysis pricing ballpark:
-# ~$5 per TB (10^12 bytes). We'll show an estimate in USD.
-BQ_USD_PER_TB = 5.0
+_cache_resource = getattr(st, "cache_resource", None)
+_cache_data = getattr(st, "cache_data", None)
 
+if _cache_resource is None:
+    # Older Streamlit fallback
+    _cache_resource = getattr(st, "experimental_singleton", st.cache)
 
-def bytes_to_human(n: int) -> str:
-    # BigQuery billing uses decimal units (TB = 10^12 bytes)
-    units = ["B", "KB", "MB", "GB", "TB", "PB"]
-    x = float(n)
-    for u in units:
-        if x < 1000.0 or u == units[-1]:
-            return f"{x:.2f} {u}"
-        x /= 1000.0
-    return f"{x:.2f} B"
+if _cache_data is None:
+    # Older Streamlit fallback
+    _cache_data = getattr(st, "experimental_memo", st.cache)
 
 
-def est_usd_cost(bytes_processed: int) -> float:
-    return (float(bytes_processed) / 1e12) * float(BQ_USD_PER_TB)
-
-
-# -------------------------
-# BigQuery (Streamlit Cloud safe)
-# -------------------------
-@st.cache_resource
+@_cache_resource
 def get_bq_client() -> bigquery.Client:
     if "gcp_service_account" not in st.secrets:
         st.error("Missing Streamlit secret: [gcp_service_account].")
@@ -43,7 +29,7 @@ def get_bq_client() -> bigquery.Client:
     return bigquery.Client(project=BQ_PROJECT, credentials=creds)
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
+@_cache_data(show_spinner=False, ttl=3600)
 def bq_load_photometry_for_provid(
     provid: str,
     *,
@@ -52,11 +38,6 @@ def bq_load_photometry_for_provid(
     stn: str = BQ_STN,
     row_limit: int = BQ_ROW_LIMIT,
 ) -> tuple[pd.DataFrame, dict]:
-    """
-    Returns:
-      df_raw: photometry rows
-      bq_meta: diagnostics incl. dry-run bytes, est cost, actual bytes, cache_hit, source_table
-    """
     client = get_bq_client()
     source_table = f"{BQ_PROJECT}.{dataset}.{table}"
 
@@ -84,7 +65,7 @@ def bq_load_photometry_for_provid(
     dry_cfg = bigquery.QueryJobConfig(
         query_parameters=params,
         dry_run=True,
-        use_query_cache=False,  # dry-run should reflect full scan estimate
+        use_query_cache=False,
     )
     dry_job = client.query(q, job_config=dry_cfg)
     dry_bytes = int(getattr(dry_job, "total_bytes_processed", 0) or 0)
@@ -101,7 +82,7 @@ def bq_load_photometry_for_provid(
     # ---- Actual run ----
     run_cfg = bigquery.QueryJobConfig(
         query_parameters=params,
-        use_query_cache=True,   # helps repeat queries
+        use_query_cache=True,
     )
     job = client.query(q, job_config=run_cfg)
     df = job.to_dataframe()
@@ -115,7 +96,7 @@ def bq_load_photometry_for_provid(
     })
 
     return df, bq_meta
-
+    
 # -------------------------
 # Horizons config
 # -------------------------
@@ -918,6 +899,7 @@ else:
         mime="text/csv",
         use_container_width=True,
     )
+
 
 
 
