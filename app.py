@@ -1,3 +1,7 @@
+import streamlit as st
+from google.cloud import bigquery
+from google.oauth2 import service_account
+
 # -------------------------
 # BigQuery (Streamlit Cloud safe) — no decorator caching
 # -------------------------
@@ -27,18 +31,12 @@ def get_bq_client():
     return client
 
 
-def bq_load_photometry_for_provid(
-    provid,
-    dataset=BQ_DATASET,
-    table=BQ_TABLE,
-    stn=BQ_STN,
-    row_limit=BQ_ROW_LIMIT,
-):
-    """
-    Returns:
-        df_raw  -> photometry DataFrame
-        bq_meta -> cost diagnostics dictionary
-    """
+def bq_load_photometry_for_provid(provid):
+
+    dataset = BQ_DATASET
+    table = BQ_TABLE
+    stn = BQ_STN
+    row_limit = BQ_ROW_LIMIT
 
     client = get_bq_client()
     source_table = f"{BQ_PROJECT}.{dataset}.{table}"
@@ -63,9 +61,6 @@ def bq_load_photometry_for_provid(
         bigquery.ScalarQueryParameter("prov", "STRING", provid),
     ]
 
-    # -------------------------
-    # Dry run (estimate bytes)
-    # -------------------------
     dry_config = bigquery.QueryJobConfig(
         query_parameters=params,
         dry_run=True,
@@ -81,12 +76,8 @@ def bq_load_photometry_for_provid(
         "dry_run_bytes_processed": dry_bytes,
         "dry_run_bytes_human": bytes_to_human(dry_bytes) if dry_bytes else "—",
         "dry_run_est_cost_usd": est_usd_cost(dry_bytes) if dry_bytes else None,
-        "note": "BigQuery charges by bytes processed. USD estimate uses ~$5/TB (10^12 bytes).",
     }
 
-    # -------------------------
-    # Actual query execution
-    # -------------------------
     run_config = bigquery.QueryJobConfig(
         query_parameters=params,
         use_query_cache=True,
@@ -908,6 +899,7 @@ else:
         mime="text/csv",
         use_container_width=True,
     )
+
 
 
 
