@@ -5,6 +5,9 @@
 # - Photometry fetched ON DEMAND from BigQuery (only needed columns)
 # - Geometry correction computed ON THE FLY (JPL Horizons) inside THIS FILE
 # - Fold + mag-vs-time plots use geometry-corrected, band-centered magnitudes by default
+#
+# ADDITIONS:
+# - Shows BigQuery "bytes processed" (dry-run estimate + actual) and estimated cost in the UI
 # ==========================================================
 
 from __future__ import annotations
@@ -46,6 +49,10 @@ BQ_DATASET = "asteroid_institute_mpc_replica"
 BQ_TABLE   = "public_obs_sbn"
 BQ_STN     = "X05"
 BQ_ROW_LIMIT = 20000
+
+# Cost estimate constant (approx BigQuery on-demand analysis pricing):
+# ~$5 per TB (decimal) processed. Your billing is in CAD; we'll show USD estimate + note.
+BQ_USD_PER_TB = 5.0  # USD / TB (10^12 bytes)
 
 # -------------------------
 # Horizons config
@@ -329,6 +336,20 @@ def plot_fold(
     ax.set_title(title)
     ax.set_xlim(0.0, 2.0 if two_cycles else 1.0)
 
+def bytes_to_human(n: int) -> str:
+    # decimal units for BigQuery billing (TB = 10^12 bytes)
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    x = float(n)
+    for u in units:
+        if x < 1000.0 or u == units[-1]:
+            return f"{x:.2f} {u}"
+        x /= 1000.0
+    return f"{x:.2f} B"
+
+def est_usd_cost(bytes_processed: int) -> float:
+    tb = float(bytes_processed) / 1e12
+    return tb * float(BQ_USD_PER_TB)
+
 
 # -------------------------
 # BigQuery (Streamlit Cloud safe)
@@ -346,8 +367,15 @@ def get_bq_client() -> bigquery.Client:
     return bigquery.Client(project=BQ_PROJECT, credentials=creds)
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def bq_load_photometry_for_provid(provid: str) -> pd.DataFrame:
+def bq_load_photometry_for_provid(provid: str) -> tuple[pd.DataFrame, dict]:
+    """
+    Returns:
+      df_raw: photometry rows
+      bq_meta: diagnostics incl. dry-run bytes, est cost, actual bytes (if available)
+    """
     client = get_bq_client()
+
+    # NOTE: removing SAFE_CAST in WHERE can help optimizations; cast in Python.
     q = f"""
     SELECT
       provid,
@@ -358,17 +386,47 @@ def bq_load_photometry_for_provid(provid: str) -> pd.DataFrame:
     FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`
     WHERE stn = @stn
       AND provid = @prov
-      AND SAFE_CAST(mag AS FLOAT64) IS NOT NULL
+      AND mag IS NOT NULL
     ORDER BY obstime
     LIMIT {int(BQ_ROW_LIMIT)}
     """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("stn", "STRING", BQ_STN),
-            bigquery.ScalarQueryParameter("prov", "STRING", provid),
-        ]
+
+    params = [
+        bigquery.ScalarQueryParameter("stn", "STRING", BQ_STN),
+        bigquery.ScalarQueryParameter("prov", "STRING", provid),
+    ]
+
+    # ---- Dry run (estimate bytes) ----
+    dry_cfg = bigquery.QueryJobConfig(
+        query_parameters=params,
+        dry_run=True,
+        use_query_cache=False,
     )
-    return client.query(q, job_config=job_config).to_dataframe()
+    dry_job = client.query(q, job_config=dry_cfg)
+    dry_bytes = int(getattr(dry_job, "total_bytes_processed", 0) or 0)
+
+    bq_meta: dict = {
+        "provid": provid,
+        "dry_run_bytes_processed": dry_bytes,
+        "dry_run_bytes_human": bytes_to_human(dry_bytes) if dry_bytes else "—",
+        "dry_run_est_cost_usd": est_usd_cost(dry_bytes) if dry_bytes else None,
+        "note": "BigQuery charges by bytes processed. USD estimate uses ~$5/TB (10^12 bytes). Your billing currency may differ.",
+    }
+
+    # ---- Actual run ----
+    run_cfg = bigquery.QueryJobConfig(query_parameters=params)
+    job = client.query(q, job_config=run_cfg)
+    df = job.to_dataframe()
+
+    actual_bytes = int(getattr(job, "total_bytes_processed", 0) or 0)
+    bq_meta.update({
+        "actual_bytes_processed": actual_bytes if actual_bytes else None,
+        "actual_bytes_human": bytes_to_human(actual_bytes) if actual_bytes else "—",
+        "actual_est_cost_usd": est_usd_cost(actual_bytes) if actual_bytes else None,
+        "cache_hit": bool(getattr(job, "cache_hit", False)),
+    })
+
+    return df, bq_meta
 
 def make_df1_from_bq(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = df_raw.copy()
@@ -452,37 +510,29 @@ if mode == "Asteroid Viewer":
     st.sidebar.markdown("---")
     st.sidebar.markdown("## Asteroid")
 
-    # Default: reliable-only ON
     if "reliable_only" not in st.session_state:
         st.session_state["reliable_only"] = True
 
     q = st.sidebar.text_input("Search Designation", value="", placeholder="E.g., 2025 ME69")
 
-    # Read state BEFORE building dropdown options (Streamlit reruns)
     reliable_only_state = bool(st.session_state.get("reliable_only", False))
-
     df_pick = master.copy()
 
-    # Search filter
     if q.strip():
         df_pick = df_pick[df_pick["Designation"].astype(str).str.contains(q.strip(), case=False, na=False)]
 
-    # Reliable-only filter (for dropdown options)
     if reliable_only_state and ("Reliability" in df_pick.columns):
         rel_s = df_pick["Reliability"].astype(str).map(reliability_short)
         df_pick = df_pick[rel_s == "reliable"]
 
     df_pick = df_pick.sort_values("Designation")
-
     designations = df_pick["Designation"].astype(str).tolist()
+
     if not designations:
-        if reliable_only_state:
-            st.sidebar.warning("No reliable-period asteroids match your current search.")
-        else:
-            st.sidebar.warning("No asteroids match your current search.")
+        st.sidebar.warning("No asteroids match your current search." if not reliable_only_state
+                           else "No reliable-period asteroids match your current search.")
         st.stop()
 
-    # Dropdown (first)
     selected = st.sidebar.selectbox(
         "Selected Asteroid",
         options=designations,
@@ -490,19 +540,16 @@ if mode == "Asteroid Viewer":
         key="selected_asteroid",
     )
 
-    # Checkbox directly under dropdown with count in brackets
     st.sidebar.checkbox(
         f"Reliable Periods only ({RELIABLE_COUNT:,})",
         value=reliable_only_state,
         key="reliable_only",
     )
 
-    # Guard: if selection becomes invalid after toggling, snap + rerun
     if bool(st.session_state.get("reliable_only", False)) and (selected not in designations):
         st.session_state.selected_asteroid = designations[0]
         st.rerun()
 
-    # Pull row from full master (not df_pick), so metrics always available
     row = master[master["Designation"].astype(str) == str(selected)]
     row = row.iloc[0].to_dict() if len(row) else {}
     rel = reliability_short(str(row.get("Reliability", "")))
@@ -534,7 +581,6 @@ if mode == "Asteroid Viewer":
         st.session_state.fold_period = float(P_adopt)
         st.rerun()
 
-    # Default bands: g r i
     LSST_BANDS = ["u", "g", "r", "i", "z", "y"]
     sel_bands_sidebar = st.sidebar.multiselect(
         "Bands",
@@ -556,7 +602,12 @@ if mode == "Asteroid Viewer":
         arc_days = row.get("Arc (days)", np.nan)
 
         with st.spinner("Querying BigQuery photometry (minimal columns) ..."):
-            df_raw = bq_load_photometry_for_provid(str(selected))
+            df_raw, bq_meta = bq_load_photometry_for_provid(str(selected))
+
+        # ---- Where you will SEE the cost ----
+        with st.expander("BigQuery Cost & Query Diagnostics", expanded=False):
+            st.write("These numbers update per asteroid selection. If bytes are huge (GB–TB), the query is scanning too much.")
+            st.json(bq_meta)
 
         if df_raw is None or len(df_raw) == 0:
             st.info("No photometry rows found in BigQuery for this asteroid (stn filter + provid match).")
