@@ -1,59 +1,120 @@
-# app.py
-# ==========================================================
-# ATLAST Rotation Dashboard
-# - Master table from local CSV
-# - Photometry fetched ON DEMAND from BigQuery (only needed columns)
-# - Geometry correction computed ON THE FLY (JPL Horizons) inside THIS FILE
-# - Fold + mag-vs-time plots use geometry-corrected, band-centered magnitudes by default
-#
-# ADDITIONS:
-# - Shows BigQuery "bytes processed" (dry-run estimate + actual) and estimated cost in the UI
-# ==========================================================
-
-from __future__ import annotations
-
-from pathlib import Path
-import os
-import re
-import numpy as np
-import pandas as pd
-import streamlit as st
-import matplotlib.pyplot as plt
-
-from google.cloud import bigquery
-from google.oauth2 import service_account
-
-from astropy.time import Time
-from astroquery.jplhorizons import Horizons
-
-
-# -------------------------
-# Page config
-# -------------------------
-st.set_page_config(
-    page_title="ATLAST Asteroid Rotation Dashboard",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# -------------------------
-# Local file(s)
-# -------------------------
-MASTER_PATH = Path("master_results_clean.csv")  # required
-
 # -------------------------
 # BigQuery config
 # -------------------------
 BQ_PROJECT = "lsst-484623"
-BQ_DATASET = "asteroid_institute_mpc_replica_views"
-BQ_TABLE   = "public_obs_sbn_clustered"
-bq_meta["source_table"] = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+BQ_DATASET = "asteroid_institute_mpc_replica_views"   # <- MV dataset
+BQ_TABLE   = "public_obs_sbn_clustered"               # <- MV name
 BQ_STN     = "X05"
 BQ_ROW_LIMIT = 20000
 
-# Cost estimate constant (approx BigQuery on-demand analysis pricing):
-# ~$5 per TB (decimal) processed. Your billing is in CAD; we'll show USD estimate + note.
-BQ_USD_PER_TB = 5.0  # USD / TB (10^12 bytes)
+# BigQuery on-demand analysis pricing ballpark:
+# ~$5 per TB (10^12 bytes). We'll show an estimate in USD.
+BQ_USD_PER_TB = 5.0
+
+
+def bytes_to_human(n: int) -> str:
+    # BigQuery billing uses decimal units (TB = 10^12 bytes)
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    x = float(n)
+    for u in units:
+        if x < 1000.0 or u == units[-1]:
+            return f"{x:.2f} {u}"
+        x /= 1000.0
+    return f"{x:.2f} B"
+
+
+def est_usd_cost(bytes_processed: int) -> float:
+    return (float(bytes_processed) / 1e12) * float(BQ_USD_PER_TB)
+
+
+# -------------------------
+# BigQuery (Streamlit Cloud safe)
+# -------------------------
+@st.cache_resource
+def get_bq_client() -> bigquery.Client:
+    if "gcp_service_account" not in st.secrets:
+        st.error("Missing Streamlit secret: [gcp_service_account].")
+        st.stop()
+    sa = dict(st.secrets["gcp_service_account"])
+    if ("client_email" not in sa) or ("private_key" not in sa):
+        st.error("Your [gcp_service_account] secret is incomplete.")
+        st.stop()
+    creds = service_account.Credentials.from_service_account_info(sa)
+    return bigquery.Client(project=BQ_PROJECT, credentials=creds)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def bq_load_photometry_for_provid(
+    provid: str,
+    *,
+    dataset: str = BQ_DATASET,
+    table: str = BQ_TABLE,
+    stn: str = BQ_STN,
+    row_limit: int = BQ_ROW_LIMIT,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Returns:
+      df_raw: photometry rows
+      bq_meta: diagnostics incl. dry-run bytes, est cost, actual bytes, cache_hit, source_table
+    """
+    client = get_bq_client()
+    source_table = f"{BQ_PROJECT}.{dataset}.{table}"
+
+    q = f"""
+    SELECT
+      provid,
+      obstime,
+      band,
+      SAFE_CAST(mag AS FLOAT64)    AS mag,
+      SAFE_CAST(rmsmag AS FLOAT64) AS rmsmag
+    FROM `{source_table}`
+    WHERE stn = @stn
+      AND provid = @prov
+      AND mag IS NOT NULL
+    ORDER BY obstime
+    LIMIT {int(row_limit)}
+    """
+
+    params = [
+        bigquery.ScalarQueryParameter("stn", "STRING", stn),
+        bigquery.ScalarQueryParameter("prov", "STRING", provid),
+    ]
+
+    # ---- Dry run (estimate bytes processed) ----
+    dry_cfg = bigquery.QueryJobConfig(
+        query_parameters=params,
+        dry_run=True,
+        use_query_cache=False,  # dry-run should reflect full scan estimate
+    )
+    dry_job = client.query(q, job_config=dry_cfg)
+    dry_bytes = int(getattr(dry_job, "total_bytes_processed", 0) or 0)
+
+    bq_meta: dict = {
+        "provid": provid,
+        "source_table": source_table,
+        "dry_run_bytes_processed": dry_bytes,
+        "dry_run_bytes_human": bytes_to_human(dry_bytes) if dry_bytes else "—",
+        "dry_run_est_cost_usd": est_usd_cost(dry_bytes) if dry_bytes else None,
+        "note": "BigQuery charges by bytes processed. USD estimate uses ~$5/TB (10^12 bytes). Your billing currency may differ.",
+    }
+
+    # ---- Actual run ----
+    run_cfg = bigquery.QueryJobConfig(
+        query_parameters=params,
+        use_query_cache=True,   # helps repeat queries
+    )
+    job = client.query(q, job_config=run_cfg)
+    df = job.to_dataframe()
+
+    actual_bytes = int(getattr(job, "total_bytes_processed", 0) or 0)
+    bq_meta.update({
+        "actual_bytes_processed": actual_bytes if actual_bytes else None,
+        "actual_bytes_human": bytes_to_human(actual_bytes) if actual_bytes else "—",
+        "actual_est_cost_usd": est_usd_cost(actual_bytes) if actual_bytes else None,
+        "cache_hit": bool(getattr(job, "cache_hit", False)),
+    })
+
+    return df, bq_meta
 
 # -------------------------
 # Horizons config
@@ -857,5 +918,6 @@ else:
         mime="text/csv",
         use_container_width=True,
     )
+
 
 
