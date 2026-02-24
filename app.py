@@ -37,21 +37,23 @@ st.set_page_config(
 MASTER_PATH = Path("master_results_clean.csv")  # required
 
 # -------------------------
-# BigQuery config (EDIT IF NEEDED)
+# BigQuery config
 # -------------------------
 BQ_PROJECT = "lsst-484623"
 BQ_DATASET = "asteroid_institute_mpc_replica"
 BQ_TABLE   = "public_obs_sbn"
-BQ_STN     = "X05"          # station filter
-BQ_ROW_LIMIT = 20000        # safety
+BQ_STN     = "X05"
+BQ_ROW_LIMIT = 20000
 
+# -------------------------
 # Horizons config
-HORIZONS_LOCATION = "X05"   # MPC code
+# -------------------------
+HORIZONS_LOCATION = "X05"
 HG_G_DEFAULT = 0.15
 
 
 # ======================================================================
-# STEP 5 — Function: Geometry correction using JPL Horizons (range query)
+# STEP 5 — Geometry correction using JPL Horizons (range query)
 # ======================================================================
 def step5_geometry_horizons_range(
     df1: pd.DataFrame,
@@ -63,16 +65,12 @@ def step5_geometry_horizons_range(
     STEP_MINUTES: int = 1,
     PAD_MINUTES: int = 5,
     FAIL_ON_UNMATCHED: bool = True,
-    TOL_DAYS: float | None = None,   # if None, auto from STEP_MINUTES
+    TOL_DAYS: float | None = None,
     show_plots: bool = False,
     save_plots: bool = False,
     save_tables: bool = False,
     verbose: bool = False,
 ):
-    def _p(*args, **kwargs):
-        if verbose:
-            print(*args, **kwargs)
-
     if df1 is None or len(df1) == 0:
         raise ValueError("STEP 5: df1 is empty.")
 
@@ -92,7 +90,6 @@ def step5_geometry_horizons_range(
 
     dfG["obstime_dt"] = pd.to_datetime(dfG["obstime_dt"], errors="coerce", utc=True)
     dfG = dfG.dropna(subset=["obstime_dt"]).sort_values("obstime_dt").reset_index(drop=True)
-
     if len(dfG) == 0:
         raise ValueError("STEP 5: all obstime_dt are NaT after coercion.")
 
@@ -207,30 +204,6 @@ def step5_geometry_horizons_range(
             dfM.loc[ok, "mag_geo"] - dfM.loc[ok].groupby("band")["mag_geo"].transform("median")
         )
 
-    out_geo = os.path.join(OUTDIR, "step5_geo_corrected.csv")
-    out_qa = os.path.join(OUTDIR, "step5_merge_qa.csv")
-
-    if save_tables:
-        dfM.to_csv(out_geo, index=False)
-        dfM[["obstime_dt", "jd_utc_obs", "jd_utc_eph", "dt_match_sec"]].to_csv(out_qa, index=False)
-
-    if save_plots or show_plots:
-        fig = plt.figure()
-        plt.scatter(dfM["t_hr"], dfM["mag"], s=10, label="mag")
-        plt.scatter(dfM["t_hr"], dfM["mag_geo"], s=10, label="mag_geo")
-        plt.scatter(dfM["t_hr"], dfM["mag_geo_bandcenter"], s=10, label="mag_geo_bandcenter")
-        plt.gca().invert_yaxis()
-        plt.xlabel("t_hr (hours)")
-        plt.ylabel("mag")
-        plt.title(f"{PROVID}: raw vs corrected drift (t_hr)")
-        plt.legend()
-        plt.tight_layout()
-        if save_plots:
-            plt.savefig(os.path.join(OUTDIR, "step5_drift_raw_vs_geo.png"), dpi=200)
-        if show_plots:
-            plt.show()
-        plt.close(fig)
-
     step5_meta = {
         "HORIZONS_LOCATION": str(HORIZONS_LOCATION),
         "G_DEFAULT": float(G_DEFAULT),
@@ -243,15 +216,13 @@ def step5_geometry_horizons_range(
         "n_matched": int(matched),
         "match_frac": float(match_frac),
         "n_unmatched": int(n_unmatched),
-        "out_geo_csv": out_geo if save_tables else None,
-        "out_merge_qa_csv": out_qa if save_tables else None,
     }
 
     return dfM, step5_meta
 
 
 # -------------------------
-# App helpers
+# Helpers
 # -------------------------
 @st.cache_data(show_spinner=False)
 def load_master(path: Path) -> pd.DataFrame:
@@ -323,25 +294,17 @@ def plot_fold(ax, t_hr: np.ndarray, mag: np.ndarray, bands: np.ndarray, P_hr: fl
 
 
 # -------------------------
-# BigQuery access (cached) — STREAMLIT CLOUD SAFE
+# BigQuery (Streamlit Cloud safe)
 # -------------------------
 @st.cache_resource
 def get_bq_client() -> bigquery.Client:
     if "gcp_service_account" not in st.secrets:
-        st.error(
-            "Missing Streamlit secret: [gcp_service_account]. "
-            "Streamlit Cloud → App → Settings → Secrets."
-        )
+        st.error("Missing Streamlit secret: [gcp_service_account].")
         st.stop()
-
     sa = dict(st.secrets["gcp_service_account"])
     if ("client_email" not in sa) or ("private_key" not in sa):
-        st.error(
-            "Your [gcp_service_account] secret is present but incomplete. "
-            "It must include at least client_email and private_key."
-        )
+        st.error("Your [gcp_service_account] secret is incomplete.")
         st.stop()
-
     creds = service_account.Credentials.from_service_account_info(sa)
     return bigquery.Client(project=BQ_PROJECT, credentials=creds)
 
@@ -388,15 +351,14 @@ def make_df1_from_bq(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False, ttl=24*3600)
 def geo_correct_cached(df1: pd.DataFrame, provid: str) -> tuple[pd.DataFrame, dict]:
-    # DEMO PERFORMANCE TWEAK: coarse Horizons grid
     df_geo, meta = step5_geometry_horizons_range(
         df1,
         PROVID=provid,
-        OUTDIR=".",  # unused (save_tables=False)
+        OUTDIR=".",
         HORIZONS_LOCATION=HORIZONS_LOCATION,
         G_DEFAULT=HG_G_DEFAULT,
-        STEP_MINUTES=10,   # ← CHANGED
-        PAD_MINUTES=10,    # ← CHANGED
+        STEP_MINUTES=10,   # DEMO
+        PAD_MINUTES=10,    # DEMO
         FAIL_ON_UNMATCHED=False,
         save_tables=False,
         save_plots=False,
@@ -426,272 +388,261 @@ for c in NUM_COLS:
     if c in master.columns:
         master[c] = safe_num(master[c])
 
+
 # -------------------------
-# Title
+# Sidebar: Mode (TOP-LEVEL)
 # -------------------------
+st.sidebar.markdown("## Mode")
+mode = st.sidebar.radio("View", ["Asteroid Viewer", "Population Explorer"], index=0)
+
 st.markdown("## ATLAST Asteroid Rotation Dashboard")
-st.caption("Photometry is queried from BigQuery per asteroid and folded using on-the-fly geometry correction (Horizons).")
 
-# -------------------------
-# Sidebar: Asteroid selection
-# -------------------------
-st.sidebar.markdown("## Asteroid")
-q = st.sidebar.text_input("Search Designation", value="", placeholder="E.g., 2025 ME69")
-
-df_pick = master.copy()
-if q.strip():
-    df_pick = df_pick[df_pick["Designation"].astype(str).str.contains(q.strip(), case=False, na=False)]
-df_pick = df_pick.sort_values("Designation")
-
-designations = df_pick["Designation"].astype(str).tolist()
-if not designations:
-    st.warning("No asteroids match your search.")
-    st.stop()
-
-selected = st.sidebar.selectbox("Selected Asteroid", options=designations, index=0)
-
-row = master[master["Designation"].astype(str) == str(selected)]
-row = row.iloc[0].to_dict() if len(row) else {}
-rel = reliability_short(str(row.get("Reliability", "")))
-
-P_adopt = float(row.get("Adopted period (hr)", np.nan))
-if not (np.isfinite(P_adopt) and P_adopt > 0):
-    P_adopt = 5.0
-
-# -------------------------
-# Sidebar: Fold controls
-# -------------------------
-st.sidebar.markdown("---")
-st.sidebar.markdown("## Fold Controls")
-
-if "fold_period" not in st.session_state or st.session_state.get("fold_period_for") != selected:
-    st.session_state.fold_period = float(P_adopt)
-    st.session_state.fold_period_for = selected
-
-lo = max(1e-6, float(P_adopt) / 2.0)
-hi = float(P_adopt) * 2.0
-
-P_calc = st.sidebar.slider(
-    "Fold Period (Hr)",
-    min_value=float(lo),
-    max_value=float(hi),
-    value=float(st.session_state.fold_period),
-    step=float((hi - lo) / 400.0) if hi > lo else 1e-6,
-)
-st.session_state.fold_period = float(P_calc)
-
-if st.sidebar.button("Reset To Adopted Period", use_container_width=True):
-    st.session_state.fold_period = float(P_adopt)
-    st.rerun()
-
-LSST_BANDS = ["u", "g", "r", "i", "z", "y"]
-if "raw_band_filter" not in st.session_state:
-    st.session_state.raw_band_filter = LSST_BANDS[:]
-sel_bands_sidebar = st.sidebar.multiselect(
-    "Bands",
-    options=LSST_BANDS,
-    default=st.session_state.raw_band_filter if isinstance(st.session_state.raw_band_filter, list) else LSST_BANDS,
-    key="raw_band_widget",
-)
-if not sel_bands_sidebar:
-    sel_bands_sidebar = LSST_BANDS
-st.session_state.raw_band_filter = sel_bands_sidebar
-
-# -------------------------
-# Sidebar: Population filters
-# -------------------------
-st.sidebar.markdown("---")
-st.sidebar.markdown("## Population Filters")
-
-rel_series = master.get("Reliability", pd.Series([], dtype=str)).dropna().astype(str)
-rel_options = sorted(rel_series.unique().tolist()) if len(rel_series) else ["reliable", "ambiguous", "insufficient", "unknown"]
-selected_rels = st.sidebar.multiselect("Reliability", options=rel_options, default=rel_options)
-if not selected_rels:
-    selected_rels = rel_options
-
-p_col = "Adopted period (hr)"
-pmin = float(np.nanmin(master[p_col])) if (p_col in master.columns and master[p_col].notna().any()) else 0.0
-pmax = float(np.nanmax(master[p_col])) if (p_col in master.columns and master[p_col].notna().any()) else 100.0
-p_lo, p_hi = st.sidebar.slider(
-    "Adopted Period Range (Hr)",
-    min_value=float(max(0.0, pmin)),
-    max_value=float(max(1.0, pmax)),
-    value=(float(max(0.0, pmin)), float(max(1.0, pmax))),
-)
-
-n_col = "Number of Observations"
-nmin = int(np.nanmin(master[n_col])) if (n_col in master.columns and master[n_col].notna().any()) else 0
-nmax = int(np.nanmax(master[n_col])) if (n_col in master.columns and master[n_col].notna().any()) else 1000
-n_lo, n_hi = st.sidebar.slider(
-    "Number Of Observations",
-    min_value=int(max(0, nmin)),
-    max_value=int(max(1, nmax)),
-    value=(int(max(0, nmin)), int(max(1, nmax))),
-)
-
-df_f = master.copy()
-if "Reliability" in df_f.columns:
-    df_f = df_f[df_f["Reliability"].astype(str).isin(selected_rels)]
-if p_col in df_f.columns:
-    df_f = df_f[df_f[p_col].between(p_lo, p_hi, inclusive="both")]
-if n_col in df_f.columns:
-    df_f = df_f[df_f[n_col].between(n_lo, n_hi, inclusive="both")]
-
-st.sidebar.caption(f"{len(df_f):,} Asteroids Match Filters")
-
-# -------------------------
-# Tabs
-# -------------------------
-tab_photo, tab_char, tab_pop = st.tabs(["Photometry", "Characterisation", "Population"])
 
 # ==========================================================
-# Photometry Tab
+# MODE 1: ASTEROID VIEWER
 # ==========================================================
-with tab_photo:
-    st.markdown(
-        f"### Geometry-Corrected Fold Preview: **{selected}** &nbsp;&nbsp;•&nbsp;&nbsp; {reliability_html(rel)}",
-        unsafe_allow_html=True,
-    )
+if mode == "Asteroid Viewer":
+    st.caption("Photometry is queried from BigQuery per asteroid and folded using on-the-fly geometry correction (Horizons).")
 
-    n_obs_master = row.get("Number of Observations", np.nan)
-    arc_days = row.get("Arc (days)", np.nan)
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("## Asteroid")
+    q = st.sidebar.text_input("Search Designation", value="", placeholder="E.g., 2025 ME69")
 
-    with st.spinner("Querying BigQuery photometry (minimal columns) ..."):
-        df_raw = bq_load_photometry_for_provid(str(selected))
+    df_pick = master.copy()
+    if q.strip():
+        df_pick = df_pick[df_pick["Designation"].astype(str).str.contains(q.strip(), case=False, na=False)]
+    df_pick = df_pick.sort_values("Designation")
 
-    if df_raw is None or len(df_raw) == 0:
-        st.info("No photometry rows found in BigQuery for this asteroid (stn filter + provid match).")
+    designations = df_pick["Designation"].astype(str).tolist()
+    if not designations:
+        st.warning("No asteroids match your search.")
         st.stop()
 
-    df1 = make_df1_from_bq(df_raw)
-    if len(df1) < 5:
-        st.warning("Very few usable points after cleaning.")
-        st.dataframe(df1.head(50), use_container_width=True)
-        st.stop()
+    selected = st.sidebar.selectbox("Selected Asteroid", options=designations, index=0)
 
-    with st.spinner("Running geometry correction (Horizons) ..."):
-        try:
-            df_geo, meta5 = geo_correct_cached(df1, str(selected))
-        except Exception as e:
-            st.error("Geometry correction failed (Horizons). Showing raw mags instead.")
-            st.exception(e)
-            df_geo = df1.copy()
-            df_geo["mag_geo"] = np.nan
-            df_geo["mag_geo_bandcenter"] = np.nan
-            meta5 = {}
+    row = master[master["Designation"].astype(str) == str(selected)]
+    row = row.iloc[0].to_dict() if len(row) else {}
+    rel = reliability_short(str(row.get("Reliability", "")))
 
-    if "mag_geo_bandcenter" in df_geo.columns and df_geo["mag_geo_bandcenter"].notna().sum() >= 5:
-        mag_col = "mag_geo_bandcenter"
-        mag_label = "mag_geo_bandcenter (corrected, band-centered)"
-    elif "mag_geo" in df_geo.columns and df_geo["mag_geo"].notna().sum() >= 5:
-        mag_col = "mag_geo"
-        mag_label = "mag_geo (corrected)"
-    else:
-        mag_col = "mag"
-        mag_label = "mag (raw)"
+    P_adopt = float(row.get("Adopted period (hr)", np.nan))
+    if not (np.isfinite(P_adopt) and P_adopt > 0):
+        P_adopt = 5.0
 
-    df_geo["band"] = df_geo["band"].astype(str).str.strip().str.lower()
-    avail = set(df_geo["band"].unique().tolist())
-    sel_bands = [b for b in st.session_state.raw_band_filter if b in avail]
-    if not sel_bands:
-        sel_bands = sorted(list(avail))
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("## Fold Controls")
 
-    dfp = df_geo[df_geo["band"].isin(sel_bands)].copy()
-    dfp = dfp.dropna(subset=["t_hr", mag_col, "band"])
+    if "fold_period" not in st.session_state or st.session_state.get("fold_period_for") != selected:
+        st.session_state.fold_period = float(P_adopt)
+        st.session_state.fold_period_for = selected
 
-    n_nights = resolve_nights(dfp)
+    lo = max(1e-6, float(P_adopt) / 2.0)
+    hi = float(P_adopt) * 2.0
 
-    s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Adopted Period (Hr)", format_float(row.get("Adopted period (hr)", np.nan), 6))
-    s2.metric("Fold Period (Hr)", format_float(P_calc, 6))
-    s3.metric("Observations (Master)", "—" if pd.isna(n_obs_master) else str(int(n_obs_master)))
-    s4.metric("Nights (Photometry)", "—" if n_nights is None else str(int(n_nights)))
+    P_calc = st.sidebar.slider(
+        "Fold Period (Hr)",
+        min_value=float(lo),
+        max_value=float(hi),
+        value=float(st.session_state.fold_period),
+        step=float((hi - lo) / 400.0) if hi > lo else 1e-6,
+    )
+    st.session_state.fold_period = float(P_calc)
 
-    if np.isfinite(float(arc_days)):
-        st.caption(f"Arc Length (Days): {format_float(arc_days, 3)}")
+    if st.sidebar.button("Reset To Adopted Period", use_container_width=True):
+        st.session_state.fold_period = float(P_adopt)
+        st.rerun()
 
-    st.caption(f"Folding uses: **{mag_label}**")
-
-    st.download_button(
-        "Download Photometry (with geometry correction columns) CSV",
-        data=df_geo.to_csv(index=False).encode("utf-8"),
-        file_name=f"{norm_id(selected)}_photometry_geo.csv",
-        mime="text/csv",
-        use_container_width=True,
+    LSST_BANDS = ["u", "g", "r", "i", "z", "y"]
+    sel_bands_sidebar = st.sidebar.multiselect(
+        "Bands",
+        options=LSST_BANDS,
+        default=LSST_BANDS,
     )
 
-    with st.expander("Geometry Correction QA (Step 5 meta)", expanded=False):
-        st.json(meta5)
+    tab_photo, tab_char = st.tabs(["Photometry", "Characterisation"])
 
-    if len(dfp) < 5:
-        st.warning("Very few points remain after band filtering. Try selecting more bands.")
-        st.stop()
+    with tab_photo:
+        st.markdown(
+            f"### Geometry-Corrected Fold Preview: **{selected}** &nbsp;&nbsp;•&nbsp;&nbsp; {reliability_html(rel)}",
+            unsafe_allow_html=True,
+        )
 
-    t_hr = dfp["t_hr"].to_numpy(float)
-    mag = pd.to_numeric(dfp[mag_col], errors="coerce").to_numpy(float)
-    bands = dfp["band"].to_numpy(str)
+        n_obs_master = row.get("Number of Observations", np.nan)
+        arc_days = row.get("Arc (days)", np.nan)
 
-    P_half = 0.5 * float(P_calc)
-    P_two = 2.0 * float(P_calc)
+        with st.spinner("Querying BigQuery photometry (minimal columns) ..."):
+            df_raw = bq_load_photometry_for_provid(str(selected))
 
-    st.markdown("#### Three-Panel Fold (P/2 • P • 2P)")
-    cols = st.columns(3)
-    periods = [P_half, float(P_calc), P_two]
-    titles = [f"P/2 = {P_half:.6f} Hr", f"P = {float(P_calc):.6f} Hr", f"2P = {P_two:.6f} Hr"]
+        if df_raw is None or len(df_raw) == 0:
+            st.info("No photometry rows found in BigQuery for this asteroid (stn filter + provid match).")
+            st.stop()
 
-    for col, P_hr, title in zip(cols, periods, titles):
-        with col:
-            fig, ax = plt.subplots(figsize=(5.2, 3.6))
-            plot_fold(ax, t_hr=t_hr, mag=mag, bands=bands, P_hr=P_hr, title=title, mag_label=mag_label)
-            ax.legend(fontsize=7)
-            st.pyplot(fig, clear_figure=True)
+        df1 = make_df1_from_bq(df_raw)
+        if len(df1) < 5:
+            st.warning("Very few usable points after cleaning.")
+            st.dataframe(df1.head(50), use_container_width=True)
+            st.stop()
 
-    st.markdown("#### Magnitude vs Time")
-    fig, ax = plt.subplots(figsize=(10.5, 3.6))
-    for b in sorted(np.unique(bands).tolist()):
-        m = (bands == b)
-        ax.scatter(t_hr[m], mag[m], s=10, label=b)
-    ax.invert_yaxis()
-    ax.set_xlabel("Hours Since First Observation")
-    ax.set_ylabel(mag_label)
-    ax.set_title("Magnitude vs Time")
-    ax.legend(fontsize=8, ncol=6)
-    st.pyplot(fig, clear_figure=True)
+        with st.spinner("Running geometry correction (Horizons) ..."):
+            try:
+                df_geo, meta5 = geo_correct_cached(df1, str(selected))
+            except Exception as e:
+                st.error("Geometry correction failed (Horizons). Showing raw mags instead.")
+                st.exception(e)
+                df_geo = df1.copy()
+                df_geo["mag_geo"] = np.nan
+                df_geo["mag_geo_bandcenter"] = np.nan
+                meta5 = {}
+
+        if "mag_geo_bandcenter" in df_geo.columns and df_geo["mag_geo_bandcenter"].notna().sum() >= 5:
+            mag_col = "mag_geo_bandcenter"
+            mag_label = "mag_geo_bandcenter (corrected, band-centered)"
+        elif "mag_geo" in df_geo.columns and df_geo["mag_geo"].notna().sum() >= 5:
+            mag_col = "mag_geo"
+            mag_label = "mag_geo (corrected)"
+        else:
+            mag_col = "mag"
+            mag_label = "mag (raw)"
+
+        df_geo["band"] = df_geo["band"].astype(str).str.strip().str.lower()
+        avail = set(df_geo["band"].unique().tolist())
+        sel_bands = [b for b in sel_bands_sidebar if b in avail]
+        if not sel_bands:
+            sel_bands = sorted(list(avail))
+
+        dfp = df_geo[df_geo["band"].isin(sel_bands)].copy()
+        dfp = dfp.dropna(subset=["t_hr", mag_col, "band"])
+        n_nights = resolve_nights(dfp)
+
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Adopted Period (Hr)", format_float(row.get("Adopted period (hr)", np.nan), 6))
+        s2.metric("Fold Period (Hr)", format_float(P_calc, 6))
+        s3.metric("Observations (Master)", "—" if pd.isna(n_obs_master) else str(int(n_obs_master)))
+        s4.metric("Nights (Photometry)", "—" if n_nights is None else str(int(n_nights)))
+
+        if np.isfinite(float(arc_days)):
+            st.caption(f"Arc Length (Days): {format_float(arc_days, 3)}")
+
+        st.caption(f"Folding uses: **{mag_label}**")
+
+        st.download_button(
+            "Download Photometry (with geometry correction columns) CSV",
+            data=df_geo.to_csv(index=False).encode("utf-8"),
+            file_name=f"{norm_id(selected)}_photometry_geo.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+        with st.expander("Geometry Correction QA (Step 5 meta)", expanded=False):
+            st.json(meta5)
+
+        if len(dfp) < 5:
+            st.warning("Very few points remain after band filtering. Try selecting more bands.")
+            st.stop()
+
+        t_hr = dfp["t_hr"].to_numpy(float)
+        mag = pd.to_numeric(dfp[mag_col], errors="coerce").to_numpy(float)
+        bands = dfp["band"].to_numpy(str)
+
+        P_half = 0.5 * float(P_calc)
+        P_two = 2.0 * float(P_calc)
+
+        st.markdown("#### Three-Panel Fold (P/2 • P • 2P)")
+        cols = st.columns(3)
+        periods = [P_half, float(P_calc), P_two]
+        titles = [f"P/2 = {P_half:.6f} Hr", f"P = {float(P_calc):.6f} Hr", f"2P = {P_two:.6f} Hr"]
+
+        for col, P_hr, title in zip(cols, periods, titles):
+            with col:
+                fig, ax = plt.subplots(figsize=(5.2, 3.6))
+                plot_fold(ax, t_hr=t_hr, mag=mag, bands=bands, P_hr=P_hr, title=title, mag_label=mag_label)
+                ax.legend(fontsize=7)
+                st.pyplot(fig, clear_figure=True)
+
+        st.markdown("#### Magnitude vs Time")
+        fig, ax = plt.subplots(figsize=(10.5, 3.6))
+        for b in sorted(np.unique(bands).tolist()):
+            m = (bands == b)
+            ax.scatter(t_hr[m], mag[m], s=10, label=b)
+        ax.invert_yaxis()
+        ax.set_xlabel("Hours Since First Observation")
+        ax.set_ylabel(mag_label)
+        ax.set_title("Magnitude vs Time")
+        ax.legend(fontsize=8, ncol=6)
+        st.pyplot(fig, clear_figure=True)
+
+    with tab_char:
+        st.markdown(
+            f"### Characterisation: **{selected}** &nbsp;&nbsp;•&nbsp;&nbsp; {reliability_html(rel)}",
+            unsafe_allow_html=True,
+        )
+        st.caption("All values on this tab come from master_results_clean.csv (Step 13 Summary Exports).")
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Adopted Period (Hr)", format_float(row.get("Adopted period (hr)", np.nan), 6))
+        k2.metric("LS Peak Period (Hr)", format_float(row.get("LS peak period (hr)", np.nan), 6))
+        k3.metric("Adopted K", "—" if pd.isna(row.get("Adopted K", np.nan)) else str(int(row.get("Adopted K"))))
+        k4.metric("Amplitude (Mag)", format_float(row.get("Amplitude (Fourier)", np.nan), 3))
+        k5.metric("Axial Elongation", format_float(row.get("Axial Elongation", np.nan), 3))
+
+        b1, b2, b3, b4, b5 = st.columns(5)
+        b1.metric("2P Candidate (Hr)", format_float(row.get("2P candidate (hr)", np.nan), 6))
+        b2.metric("ΔBIC(2P−P)", format_float(row.get("ΔBIC(2P−P)", np.nan), 3))
+        b3.metric("Bootstrap Top_Frac", format_float(row.get("Bootstrap top_frac", np.nan), 3))
+        b4.metric("Unique Winners", "—" if pd.isna(row.get("Bootstrap n_unique_winners", np.nan)) else str(int(row.get("Bootstrap n_unique_winners"))))
+        b5.metric("Family Size", "—" if pd.isna(row.get("Bootstrap family_size", np.nan)) else str(int(row.get("Bootstrap family_size"))))
+
+        st.markdown("#### Colors")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("g − r", format_float(row.get("g - r", np.nan), 4))
+        c2.metric("g − i", format_float(row.get("g - i", np.nan), 4))
+        c3.metric("r − i", format_float(row.get("r - i", np.nan), 4))
+
 
 # ==========================================================
-# Characterisation Tab
+# MODE 2: POPULATION EXPLORER
 # ==========================================================
-with tab_char:
-    st.markdown(
-        f"### Characterisation: **{selected}** &nbsp;&nbsp;•&nbsp;&nbsp; {reliability_html(rel)}",
-        unsafe_allow_html=True,
+else:
+    st.caption("Explore the population distribution using filters in the sidebar.")
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("## Population Filters")
+
+    rel_series = master.get("Reliability", pd.Series([], dtype=str)).dropna().astype(str)
+    rel_options = sorted(rel_series.unique().tolist()) if len(rel_series) else ["reliable", "ambiguous", "insufficient", "unknown"]
+    selected_rels = st.sidebar.multiselect("Reliability", options=rel_options, default=rel_options)
+    if not selected_rels:
+        selected_rels = rel_options
+
+    p_col = "Adopted period (hr)"
+    pmin = float(np.nanmin(master[p_col])) if (p_col in master.columns and master[p_col].notna().any()) else 0.0
+    pmax = float(np.nanmax(master[p_col])) if (p_col in master.columns and master[p_col].notna().any()) else 100.0
+    p_lo, p_hi = st.sidebar.slider(
+        "Adopted Period Range (Hr)",
+        min_value=float(max(0.0, pmin)),
+        max_value=float(max(1.0, pmax)),
+        value=(float(max(0.0, pmin)), float(max(1.0, pmax))),
     )
-    st.caption("All values on this tab come from master_results_clean.csv (Step 13 Summary Exports).")
 
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Adopted Period (Hr)", format_float(row.get("Adopted period (hr)", np.nan), 6))
-    k2.metric("LS Peak Period (Hr)", format_float(row.get("LS peak period (hr)", np.nan), 6))
-    k3.metric("Adopted K", "—" if pd.isna(row.get("Adopted K", np.nan)) else str(int(row.get("Adopted K"))))
-    k4.metric("Amplitude (Mag)", format_float(row.get("Amplitude (Fourier)", np.nan), 3))
-    k5.metric("Axial Elongation", format_float(row.get("Axial Elongation", np.nan), 3))
+    n_col = "Number of Observations"
+    nmin = int(np.nanmin(master[n_col])) if (n_col in master.columns and master[n_col].notna().any()) else 0
+    nmax = int(np.nanmax(master[n_col])) if (n_col in master.columns and master[n_col].notna().any()) else 1000
+    n_lo, n_hi = st.sidebar.slider(
+        "Number Of Observations",
+        min_value=int(max(0, nmin)),
+        max_value=int(max(1, nmax)),
+        value=(int(max(0, nmin)), int(max(1, nmax))),
+    )
 
-    b1, b2, b3, b4, b5 = st.columns(5)
-    b1.metric("2P Candidate (Hr)", format_float(row.get("2P candidate (hr)", np.nan), 6))
-    b2.metric("ΔBIC(2P−P)", format_float(row.get("ΔBIC(2P−P)", np.nan), 3))
-    b3.metric("Bootstrap Top_Frac", format_float(row.get("Bootstrap top_frac", np.nan), 3))
-    b4.metric("Unique Winners", "—" if pd.isna(row.get("Bootstrap n_unique_winners", np.nan)) else str(int(row.get("Bootstrap n_unique_winners"))))
-    b5.metric("Family Size", "—" if pd.isna(row.get("Bootstrap family_size", np.nan)) else str(int(row.get("Bootstrap family_size"))))
+    df_f = master.copy()
+    if "Reliability" in df_f.columns:
+        df_f = df_f[df_f["Reliability"].astype(str).isin(selected_rels)]
+    if p_col in df_f.columns:
+        df_f = df_f[df_f[p_col].between(p_lo, p_hi, inclusive="both")]
+    if n_col in df_f.columns:
+        df_f = df_f[df_f[n_col].between(n_lo, n_hi, inclusive="both")]
 
-    st.markdown("#### Colors")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("g − r", format_float(row.get("g - r", np.nan), 4))
-    c2.metric("g − i", format_float(row.get("g - i", np.nan), 4))
-    c3.metric("r − i", format_float(row.get("r - i", np.nan), 4))
+    st.sidebar.caption(f"{len(df_f):,} Asteroids Match Filters")
 
-# ==========================================================
-# Population Tab
-# ==========================================================
-with tab_pop:
     st.markdown("### Population Overview (Filtered)")
     if len(df_f) == 0:
         st.warning("No asteroids match your current population filters. Widen the ranges or reselect reliability options.")
