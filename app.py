@@ -280,17 +280,30 @@ def resolve_nights(df: pd.DataFrame) -> int | None:
             return int(dt.dt.date.nunique())
     return None
 
-def plot_fold(ax, t_hr: np.ndarray, mag: np.ndarray, bands: np.ndarray, P_hr: float, title: str, mag_label: str):
+def plot_fold(
+    ax,
+    t_hr: np.ndarray,
+    mag: np.ndarray,
+    bands: np.ndarray,
+    P_hr: float,
+    title: str,
+    mag_label: str,
+    *,
+    two_cycles: bool = False,
+):
     phase = (t_hr / float(P_hr)) % 1.0
     uniq = sorted(np.unique(bands).tolist())
     for b in uniq:
         m = (bands == b)
         ax.scatter(phase[m], mag[m], s=10, label=str(b))
-        ax.scatter(phase[m] + 1.0, mag[m], s=10)
+        if two_cycles:
+            ax.scatter(phase[m] + 1.0, mag[m], s=10)
+
     ax.invert_yaxis()
-    ax.set_xlabel("Phase")
+    ax.set_xlabel("Phase (0–1)" if not two_cycles else "Phase (0–2)")
     ax.set_ylabel(mag_label)
     ax.set_title(title)
+    ax.set_xlim(0.0, 2.0 if two_cycles else 1.0)
 
 
 # -------------------------
@@ -388,7 +401,6 @@ for c in NUM_COLS:
     if c in master.columns:
         master[c] = safe_num(master[c])
 
-
 # -------------------------
 # Sidebar: Mode (TOP-LEVEL)
 # -------------------------
@@ -451,12 +463,15 @@ if mode == "Asteroid Viewer":
         st.session_state.fold_period = float(P_adopt)
         st.rerun()
 
+    # Default bands: g r i
     LSST_BANDS = ["u", "g", "r", "i", "z", "y"]
     sel_bands_sidebar = st.sidebar.multiselect(
         "Bands",
         options=LSST_BANDS,
-        default=LSST_BANDS,
+        default=["g", "r", "i"],
     )
+
+    two_cycles = st.sidebar.checkbox("Show two cycles (0–2)", value=False)
 
     tab_photo, tab_char = st.tabs(["Photometry", "Characterisation"])
 
@@ -554,7 +569,16 @@ if mode == "Asteroid Viewer":
         for col, P_hr, title in zip(cols, periods, titles):
             with col:
                 fig, ax = plt.subplots(figsize=(5.2, 3.6))
-                plot_fold(ax, t_hr=t_hr, mag=mag, bands=bands, P_hr=P_hr, title=title, mag_label=mag_label)
+                plot_fold(
+                    ax,
+                    t_hr=t_hr,
+                    mag=mag,
+                    bands=bands,
+                    P_hr=P_hr,
+                    title=title,
+                    mag_label=mag_label,
+                    two_cycles=two_cycles,
+                )
                 ax.legend(fontsize=7)
                 st.pyplot(fig, clear_figure=True)
 
@@ -609,9 +633,12 @@ else:
 
     rel_series = master.get("Reliability", pd.Series([], dtype=str)).dropna().astype(str)
     rel_options = sorted(rel_series.unique().tolist()) if len(rel_series) else ["reliable", "ambiguous", "insufficient", "unknown"]
-    selected_rels = st.sidebar.multiselect("Reliability", options=rel_options, default=rel_options)
+
+    # Default reliability: reliable
+    default_rels = ["reliable"] if "reliable" in rel_options else rel_options
+    selected_rels = st.sidebar.multiselect("Reliability", options=rel_options, default=default_rels)
     if not selected_rels:
-        selected_rels = rel_options
+        selected_rels = default_rels
 
     p_col = "Adopted period (hr)"
     pmin = float(np.nanmin(master[p_col])) if (p_col in master.columns and master[p_col].notna().any()) else 0.0
