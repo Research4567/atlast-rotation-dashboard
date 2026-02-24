@@ -47,14 +47,32 @@ HG_G_DEFAULT = 0.15
 # BIGQUERY AUTH (STREAMLIT CLOUD SAFE)
 # ==========================================================
 @st.cache_resource
-def get_bq_client() -> bigquery.Client:
-    if "gcp_service_account" in st.secrets:
-        creds = service_account.Credentials.from_service_account_info(
-            dict(st.secrets["gcp_service_account"])
-        )
-        return bigquery.Client(project=BQ_PROJECT, credentials=creds)
+from google.oauth2 import service_account
+from google.cloud import bigquery
+import streamlit as st
 
-    return bigquery.Client(project=BQ_PROJECT)
+@st.cache_resource
+def get_bq_client() -> bigquery.Client:
+    # HARD fail with a clear message if secrets aren't present
+    if "gcp_service_account" not in st.secrets:
+        st.error(
+            "Missing Streamlit secret: [gcp_service_account]. "
+            "Go to Streamlit Cloud → App → Settings → Secrets and paste the service account TOML."
+        )
+        st.stop()
+
+    sa = dict(st.secrets["gcp_service_account"])
+
+    # Optional sanity check
+    if "client_email" not in sa or "private_key" not in sa:
+        st.error(
+            "Your [gcp_service_account] secret is present but incomplete. "
+            "It must include at least client_email and private_key."
+        )
+        st.stop()
+
+    creds = service_account.Credentials.from_service_account_info(sa)
+    return bigquery.Client(project=BQ_PROJECT, credentials=creds)
 
 
 # ==========================================================
@@ -240,3 +258,4 @@ ax.set_ylabel("Corrected Mag")
 ax.legend()
 
 st.pyplot(fig)
+
