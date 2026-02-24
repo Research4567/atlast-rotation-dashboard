@@ -1,3 +1,4 @@
+# app.py
 # ==========================================================
 # ATLAST Rotation Dashboard
 # - Master table from local CSV
@@ -441,20 +442,55 @@ if mode == "Asteroid Viewer":
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("## Asteroid")
+
     q = st.sidebar.text_input("Search Designation", value="", placeholder="E.g., 2025 ME69")
 
+    # ------------------------------------------------------
+    # Reliable-only state (read BEFORE building dropdown options)
+    # The checkbox is rendered BELOW the dropdown for UI, but
+    # the value is pulled from st.session_state (updated on rerun).
+    # ------------------------------------------------------
+    reliable_only_state = bool(st.session_state.get("reliable_only", False))
+
     df_pick = master.copy()
+
+    # Search filter
     if q.strip():
         df_pick = df_pick[df_pick["Designation"].astype(str).str.contains(q.strip(), case=False, na=False)]
+
+    # Reliable-only filter (for dropdown options)
+    if reliable_only_state and ("Reliability" in df_pick.columns):
+        rel_s = df_pick["Reliability"].astype(str).map(reliability_short)
+        df_pick = df_pick[rel_s == "reliable"]
+
     df_pick = df_pick.sort_values("Designation")
 
     designations = df_pick["Designation"].astype(str).tolist()
     if not designations:
-        st.warning("No asteroids match your search.")
+        if reliable_only_state:
+            st.sidebar.warning("No reliable-period asteroids match your current search.")
+        else:
+            st.sidebar.warning("No asteroids match your current search.")
         st.stop()
 
-    selected = st.sidebar.selectbox("Selected Asteroid", options=designations, index=0)
+    # Dropdown (first)
+    selected = st.sidebar.selectbox(
+        "Selected Asteroid",
+        options=designations,
+        index=0,
+        key="selected_asteroid",
+    )
 
+    # Checkbox directly under dropdown (as requested)
+    st.sidebar.checkbox("Reliable Periods only", value=reliable_only_state, key="reliable_only")
+
+    # If user just toggled reliable_only ON and current selection is no longer valid,
+    # the next rerun will rebuild options; but we also guard in case state lags.
+    if bool(st.session_state.get("reliable_only", False)) and (selected not in designations):
+        st.session_state.selected_asteroid = designations[0]
+        st.rerun()
+
+    # Pull row from full master (not df_pick), so metrics always available
     row = master[master["Designation"].astype(str) == str(selected)]
     row = row.iloc[0].to_dict() if len(row) else {}
     rel = reliability_short(str(row.get("Reliability", "")))
@@ -626,20 +662,17 @@ if mode == "Asteroid Viewer":
         )
         st.caption("All values on this tab come from master_results_clean.csv (Step 13 Summary Exports).")
 
-        # Removed: LS Peak Period (Hr)
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Adopted Period (Hr)", format_float(row.get("Adopted period (hr)", np.nan), 6))
         k2.metric("Adopted K", "—" if pd.isna(row.get("Adopted K", np.nan)) else str(int(row.get("Adopted K"))))
         k3.metric("Amplitude (Mag)", format_float(row.get("Amplitude (Fourier)", np.nan), 3))
         k4.metric("Axial Elongation", format_float(row.get("Axial Elongation", np.nan), 3))
 
-        # Removed: Unique Winners, Family Size
         b1, b2, b3 = st.columns(3)
         b1.metric("2P Candidate (Hr)", format_float(row.get("2P candidate (hr)", np.nan), 6))
         b2.metric("ΔBIC(2P−P)", format_float(row.get("ΔBIC(2P−P)", np.nan), 3))
         b3.metric("Bootstrap Top_Frac", format_float(row.get("Bootstrap top_frac", np.nan), 3))
 
-        # Rename section header
         st.markdown("#### Color Indices")
         c1, c2, c3 = st.columns(3)
         c1.metric("g − r", format_float(row.get("g - r", np.nan), 4))
