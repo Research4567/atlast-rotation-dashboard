@@ -452,11 +452,13 @@ if mode == "Asteroid Viewer":
     st.sidebar.markdown("---")
     st.sidebar.markdown("## Asteroid")
 
+    # Default: reliable-only ON
+    if "reliable_only" not in st.session_state:
+        st.session_state["reliable_only"] = True
+
     q = st.sidebar.text_input("Search Designation", value="", placeholder="E.g., 2025 ME69")
 
-    # ------------------------------------------------------
     # Read state BEFORE building dropdown options (Streamlit reruns)
-    # ------------------------------------------------------
     reliable_only_state = bool(st.session_state.get("reliable_only", False))
 
     df_pick = master.copy()
@@ -599,18 +601,18 @@ if mode == "Asteroid Viewer":
         n_nights = resolve_nights(dfp)
 
         s1, s2, s3, s4 = st.columns(4)
-        s1.metric("Adopted Period (Hr)", format_float(row.get("Adopted period (hr)", np.nan), 6))
-        s2.metric("Fold Period (Hr)", format_float(P_calc, 6))
-        s3.metric("Observations (Master)", "—" if pd.isna(n_obs_master) else str(int(n_obs_master)))
-        s4.metric("Nights (Photometry)", "—" if n_nights is None else str(int(n_nights)))
+        s1.metric("Adopted Rotation Period (hours)", format_float(row.get("Adopted period (hr)", np.nan), 6))
+        s2.metric("Fold Period (hours)", format_float(P_calc, 6))
+        s3.metric("Observations (number)", "—" if pd.isna(n_obs_master) else str(int(n_obs_master)))
+        s4.metric("Nights (photometry)", "—" if n_nights is None else str(int(n_nights)))
 
         if np.isfinite(float(arc_days)):
-            st.caption(f"Arc Length (Days): {format_float(arc_days, 3)}")
+            st.caption(f"Arc Length (days): {format_float(arc_days, 3)}")
 
         st.caption(f"Folding uses: **{mag_label}**")
 
         st.download_button(
-            "Download Photometry (with geometry correction columns) CSV",
+            "Download Photometry CSV",
             data=df_geo.to_csv(index=False).encode("utf-8"),
             file_name=f"{norm_id(selected)}_photometry_geo.csv",
             mime="text/csv",
@@ -672,7 +674,7 @@ if mode == "Asteroid Viewer":
         st.caption("All values on this tab come from master_results_clean.csv (Step 13 Summary Exports).")
 
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Adopted Period (Hr)", format_float(row.get("Adopted period (hr)", np.nan), 6))
+        k1.metric("Adopted Rotation Period (hours)", format_float(row.get("Adopted period (hr)", np.nan), 6))
         k2.metric("Adopted K", "—" if pd.isna(row.get("Adopted K", np.nan)) else str(int(row.get("Adopted K"))))
         k3.metric("Amplitude (Mag)", format_float(row.get("Amplitude (Fourier)", np.nan), 3))
         k4.metric("Axial Elongation", format_float(row.get("Axial Elongation", np.nan), 3))
