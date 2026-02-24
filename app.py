@@ -1,35 +1,27 @@
 # -------------------------
-# BigQuery (Streamlit Cloud safe) — compatible caching
+# BigQuery (Streamlit Cloud safe) — NO decorator caching (version-proof)
 # -------------------------
-# Some Streamlit Cloud environments are on older Streamlit versions.
-# Use cache_resource/cache_data if available; otherwise fall back.
-
-_cache_resource = getattr(st, "cache_resource", None)
-_cache_data = getattr(st, "cache_data", None)
-
-if _cache_resource is None:
-    # Older Streamlit fallback
-    _cache_resource = getattr(st, "experimental_singleton", st.cache)
-
-if _cache_data is None:
-    # Older Streamlit fallback
-    _cache_data = getattr(st, "experimental_memo", st.cache)
-
-
-@_cache_resource
 def get_bq_client() -> bigquery.Client:
+    # Cache the client in session_state (works in all Streamlit versions)
+    if "_bq_client" in st.session_state:
+        return st.session_state["_bq_client"]
+
     if "gcp_service_account" not in st.secrets:
         st.error("Missing Streamlit secret: [gcp_service_account].")
         st.stop()
+
     sa = dict(st.secrets["gcp_service_account"])
     if ("client_email" not in sa) or ("private_key" not in sa):
         st.error("Your [gcp_service_account] secret is incomplete.")
         st.stop()
+
     creds = service_account.Credentials.from_service_account_info(sa)
-    return bigquery.Client(project=BQ_PROJECT, credentials=creds)
+    client = bigquery.Client(project=BQ_PROJECT, credentials=creds)
+
+    st.session_state["_bq_client"] = client
+    return client
 
 
-@_cache_data(show_spinner=False, ttl=3600)
 def bq_load_photometry_for_provid(
     provid: str,
     *,
@@ -899,6 +891,7 @@ else:
         mime="text/csv",
         use_container_width=True,
     )
+
 
 
 
