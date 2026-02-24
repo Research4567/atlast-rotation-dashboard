@@ -47,6 +47,7 @@ MASTER_PATH = Path("master_results_clean.csv")  # required
 BQ_PROJECT = "lsst-484623"
 BQ_DATASET = "asteroid_institute_mpc_replica_views"
 BQ_TABLE   = "public_obs_sbn_clustered"
+bq_meta["source_table"] = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
 BQ_STN     = "X05"
 BQ_ROW_LIMIT = 20000
 
@@ -856,4 +857,5 @@ else:
         mime="text/csv",
         use_container_width=True,
     )
+
 
