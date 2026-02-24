@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -52,6 +53,28 @@ HORIZONS_LOCATION = "X05"
 HG_G_DEFAULT = 0.15
 
 
+# -------------------------
+# Band normalization
+# -------------------------
+LSST_CANON = {"u", "g", "r", "i", "z", "y"}
+
+def normalize_lsst_band(x) -> str:
+    if x is None:
+        return ""
+    s = str(x).strip().lower()
+
+    # common in some exports: 'lg','lr','li','lu','lz','ly' -> 'g','r','i','u','z','y'
+    if len(s) == 2 and s[0] == "l" and s[1] in LSST_CANON:
+        return s[1]
+
+    # allow 'lsstg' etc.
+    m = re.match(r"^(?:lsst)?([ugrizy])$", s)
+    if m:
+        return m.group(1)
+
+    return s
+
+
 # ======================================================================
 # STEP 5 — Geometry correction using JPL Horizons (range query)
 # ======================================================================
@@ -86,7 +109,7 @@ def step5_geometry_horizons_range(
         os.makedirs(OUTDIR, exist_ok=True)
 
     dfG = df1.copy()
-    dfG["band"] = dfG["band"].astype(str).str.strip().str.lower()
+    dfG["band"] = dfG["band"].map(normalize_lsst_band)
 
     dfG["obstime_dt"] = pd.to_datetime(dfG["obstime_dt"], errors="coerce", utc=True)
     dfG = dfG.dropna(subset=["obstime_dt"]).sort_values("obstime_dt").reset_index(drop=True)
@@ -351,7 +374,7 @@ def make_df1_from_bq(df_raw: pd.DataFrame) -> pd.DataFrame:
     df["obstime_dt"] = pd.to_datetime(df["obstime"], errors="coerce", utc=True)
     df["mag"] = pd.to_numeric(df["mag"], errors="coerce")
     df["rmsmag"] = pd.to_numeric(df.get("rmsmag", np.nan), errors="coerce")
-    df["band"] = df.get("band", "x").astype(str).str.strip().str.lower()
+    df["band"] = df.get("band", "x").map(normalize_lsst_band)
 
     df = df.dropna(subset=["obstime_dt", "mag", "band"]).sort_values("obstime_dt").reset_index(drop=True)
     if len(df) == 0:
@@ -518,8 +541,10 @@ if mode == "Asteroid Viewer":
             mag_col = "mag"
             mag_label = "mag (raw)"
 
-        df_geo["band"] = df_geo["band"].astype(str).str.strip().str.lower()
-        avail = set(df_geo["band"].unique().tolist())
+        # normalize again for safety (merge any lr/lg/li/lu that sneak in)
+        df_geo["band"] = df_geo["band"].map(normalize_lsst_band)
+
+        avail = set(df_geo["band"].dropna().astype(str).unique().tolist())
         sel_bands = [b for b in sel_bands_sidebar if b in avail]
         if not sel_bands:
             sel_bands = sorted(list(avail))
@@ -601,21 +626,21 @@ if mode == "Asteroid Viewer":
         )
         st.caption("All values on this tab come from master_results_clean.csv (Step 13 Summary Exports).")
 
-        k1, k2, k3, k4, k5 = st.columns(5)
+        # Removed: LS Peak Period (Hr)
+        k1, k2, k3, k4 = st.columns(4)
         k1.metric("Adopted Period (Hr)", format_float(row.get("Adopted period (hr)", np.nan), 6))
-        k2.metric("LS Peak Period (Hr)", format_float(row.get("LS peak period (hr)", np.nan), 6))
-        k3.metric("Adopted K", "—" if pd.isna(row.get("Adopted K", np.nan)) else str(int(row.get("Adopted K"))))
-        k4.metric("Amplitude (Mag)", format_float(row.get("Amplitude (Fourier)", np.nan), 3))
-        k5.metric("Axial Elongation", format_float(row.get("Axial Elongation", np.nan), 3))
+        k2.metric("Adopted K", "—" if pd.isna(row.get("Adopted K", np.nan)) else str(int(row.get("Adopted K"))))
+        k3.metric("Amplitude (Mag)", format_float(row.get("Amplitude (Fourier)", np.nan), 3))
+        k4.metric("Axial Elongation", format_float(row.get("Axial Elongation", np.nan), 3))
 
-        b1, b2, b3, b4, b5 = st.columns(5)
+        # Removed: Unique Winners, Family Size
+        b1, b2, b3 = st.columns(3)
         b1.metric("2P Candidate (Hr)", format_float(row.get("2P candidate (hr)", np.nan), 6))
         b2.metric("ΔBIC(2P−P)", format_float(row.get("ΔBIC(2P−P)", np.nan), 3))
         b3.metric("Bootstrap Top_Frac", format_float(row.get("Bootstrap top_frac", np.nan), 3))
-        b4.metric("Unique Winners", "—" if pd.isna(row.get("Bootstrap n_unique_winners", np.nan)) else str(int(row.get("Bootstrap n_unique_winners"))))
-        b5.metric("Family Size", "—" if pd.isna(row.get("Bootstrap family_size", np.nan)) else str(int(row.get("Bootstrap family_size"))))
 
-        st.markdown("#### Colors")
+        # Rename section header
+        st.markdown("#### Color Indices")
         c1, c2, c3 = st.columns(3)
         c1.metric("g − r", format_float(row.get("g - r", np.nan), 4))
         c2.metric("g − i", format_float(row.get("g - i", np.nan), 4))
