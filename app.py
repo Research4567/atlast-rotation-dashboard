@@ -426,6 +426,15 @@ for c in NUM_COLS:
         master[c] = safe_num(master[c])
 
 # -------------------------
+# Precompute reliable count (for label)
+# -------------------------
+if "Reliability" in master.columns:
+    _rel_short_all = master["Reliability"].astype(str).map(reliability_short)
+    RELIABLE_COUNT = int((_rel_short_all == "reliable").sum())
+else:
+    RELIABLE_COUNT = 0
+
+# -------------------------
 # Sidebar: Mode (TOP-LEVEL)
 # -------------------------
 st.sidebar.markdown("## Mode")
@@ -446,9 +455,7 @@ if mode == "Asteroid Viewer":
     q = st.sidebar.text_input("Search Designation", value="", placeholder="E.g., 2025 ME69")
 
     # ------------------------------------------------------
-    # Reliable-only state (read BEFORE building dropdown options)
-    # The checkbox is rendered BELOW the dropdown for UI, but
-    # the value is pulled from st.session_state (updated on rerun).
+    # Read state BEFORE building dropdown options (Streamlit reruns)
     # ------------------------------------------------------
     reliable_only_state = bool(st.session_state.get("reliable_only", False))
 
@@ -481,11 +488,14 @@ if mode == "Asteroid Viewer":
         key="selected_asteroid",
     )
 
-    # Checkbox directly under dropdown (as requested)
-    st.sidebar.checkbox("Reliable Periods only", value=reliable_only_state, key="reliable_only")
+    # Checkbox directly under dropdown with count in brackets
+    st.sidebar.checkbox(
+        f"Reliable Periods only ({RELIABLE_COUNT:,})",
+        value=reliable_only_state,
+        key="reliable_only",
+    )
 
-    # If user just toggled reliable_only ON and current selection is no longer valid,
-    # the next rerun will rebuild options; but we also guard in case state lags.
+    # Guard: if selection becomes invalid after toggling, snap + rerun
     if bool(st.session_state.get("reliable_only", False)) and (selected not in designations):
         st.session_state.selected_asteroid = designations[0]
         st.rerun()
@@ -577,7 +587,6 @@ if mode == "Asteroid Viewer":
             mag_col = "mag"
             mag_label = "mag (raw)"
 
-        # normalize again for safety (merge any lr/lg/li/lu that sneak in)
         df_geo["band"] = df_geo["band"].map(normalize_lsst_band)
 
         avail = set(df_geo["band"].dropna().astype(str).unique().tolist())
@@ -692,7 +701,6 @@ else:
     rel_series = master.get("Reliability", pd.Series([], dtype=str)).dropna().astype(str)
     rel_options = sorted(rel_series.unique().tolist()) if len(rel_series) else ["reliable", "ambiguous", "insufficient", "unknown"]
 
-    # Default reliability: reliable
     default_rels = ["reliable"] if "reliable" in rel_options else rel_options
     selected_rels = st.sidebar.multiselect("Reliability", options=rel_options, default=default_rels)
     if not selected_rels:
