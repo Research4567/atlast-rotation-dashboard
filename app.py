@@ -116,22 +116,13 @@ def bq_load_photometry_for_provid(provid):
         bigquery.ScalarQueryParameter("prov", "STRING", provid),
     ]
 
-    # ---- Dry run (estimate bytes processed) ----
-    dry_config = bigquery.QueryJobConfig(
-        query_parameters=params,
-        dry_run=True,
-        use_query_cache=False,
-    )
-    dry_job = client.query(query, job_config=dry_config)
-    dry_bytes = int(getattr(dry_job, "total_bytes_processed", 0) or 0)
-
+    # ---- Dry run skipped to avoid NotFound / location / permission issues ----
     bq_meta = {
         "provid": provid,
         "source_table": source_table,
-        "dry_run_bytes_processed": dry_bytes,
-        "dry_run_bytes_human": bytes_to_human(dry_bytes) if dry_bytes else "—",
-        "dry_run_est_cost_usd": est_usd_cost(dry_bytes) if dry_bytes else None,
-        "note": "BigQuery charges by bytes processed. USD estimate uses ~$5/TB (10^12 bytes).",
+        "location": BQ_LOCATION,
+        "dry_run_skipped": True,
+        "note": "Dry-run skipped. Using actual bytes from executed query.",
     }
 
     # ---- Actual run ----
@@ -139,7 +130,9 @@ def bq_load_photometry_for_provid(provid):
         query_parameters=params,
         use_query_cache=True,
     )
-    job = client.query(query, job_config=run_config)
+
+    # IMPORTANT: pass location
+    job = client.query(query, job_config=run_config, location=BQ_LOCATION)
     df = job.to_dataframe()
 
     actual_bytes = int(getattr(job, "total_bytes_processed", 0) or 0)
@@ -151,7 +144,6 @@ def bq_load_photometry_for_provid(provid):
     })
 
     return df, bq_meta
-
 
 # -------------------------
 # Band normalization
@@ -842,6 +834,7 @@ else:
         mime="text/csv",
         use_container_width=True,
     )
+
 
 
 
