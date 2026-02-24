@@ -1,16 +1,77 @@
+from __future__ import annotations
+
+from pathlib import Path
+import os
+import re
+import numpy as np
+import pandas as pd
 import streamlit as st
+import matplotlib.pyplot as plt
+
 from google.cloud import bigquery
 from google.oauth2 import service_account
+
+from astropy.time import Time
+from astroquery.jplhorizons import Horizons
+
+
+# -------------------------
+# Page config
+# -------------------------
+st.set_page_config(
+    page_title="ATLAST Asteroid Rotation Dashboard",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# -------------------------
+# Local file(s)
+# -------------------------
+MASTER_PATH = Path("master_results_clean.csv")  # required
+
+
+# -------------------------
+# BigQuery config
+# -------------------------
+BQ_PROJECT = "lsst-484623"
+BQ_DATASET = "asteroid_institute_mpc_replica_views"   # MV dataset
+BQ_TABLE   = "public_obs_sbn_clustered"               # MV name
+BQ_STN     = "X05"
+BQ_ROW_LIMIT = 20000
+
+# BigQuery on-demand analysis pricing ballpark:
+BQ_USD_PER_TB = 5.0  # USD / TB (10^12 bytes)
+
+
+# -------------------------
+# Horizons config
+# -------------------------
+HORIZONS_LOCATION = "X05"
+HG_G_DEFAULT = 0.15
+
+
+# -------------------------
+# Helpers: cost formatting
+# -------------------------
+def bytes_to_human(n):
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    x = float(n)
+    for u in units:
+        if x < 1000.0 or u == units[-1]:
+            return f"{x:.2f} {u}"
+        x /= 1000.0
+    return f"{x:.2f} B"
+
+
+def est_usd_cost(bytes_processed):
+    return (float(bytes_processed) / 1e12) * float(BQ_USD_PER_TB)
+
 
 # -------------------------
 # BigQuery (Streamlit Cloud safe) — no decorator caching
 # -------------------------
-
 def get_bq_client():
-    """
-    Create and cache a BigQuery client using Streamlit session_state.
-    Works across all Streamlit versions.
-    """
+    # Cache the client in session_state (works in all Streamlit versions)
     if "_bq_client" in st.session_state:
         return st.session_state["_bq_client"]
 
@@ -19,7 +80,6 @@ def get_bq_client():
         st.stop()
 
     sa = dict(st.secrets["gcp_service_account"])
-
     if ("client_email" not in sa) or ("private_key" not in sa):
         st.error("Your [gcp_service_account] secret is incomplete.")
         st.stop()
@@ -32,14 +92,8 @@ def get_bq_client():
 
 
 def bq_load_photometry_for_provid(provid):
-
-    dataset = BQ_DATASET
-    table = BQ_TABLE
-    stn = BQ_STN
-    row_limit = BQ_ROW_LIMIT
-
     client = get_bq_client()
-    source_table = f"{BQ_PROJECT}.{dataset}.{table}"
+    source_table = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
 
     query = f"""
     SELECT
@@ -53,20 +107,20 @@ def bq_load_photometry_for_provid(provid):
       AND provid = @prov
       AND mag IS NOT NULL
     ORDER BY obstime
-    LIMIT {int(row_limit)}
+    LIMIT {int(BQ_ROW_LIMIT)}
     """
 
     params = [
-        bigquery.ScalarQueryParameter("stn", "STRING", stn),
+        bigquery.ScalarQueryParameter("stn", "STRING", BQ_STN),
         bigquery.ScalarQueryParameter("prov", "STRING", provid),
     ]
 
+    # ---- Dry run (estimate bytes processed) ----
     dry_config = bigquery.QueryJobConfig(
         query_parameters=params,
         dry_run=True,
         use_query_cache=False,
     )
-
     dry_job = client.query(query, job_config=dry_config)
     dry_bytes = int(getattr(dry_job, "total_bytes_processed", 0) or 0)
 
@@ -76,18 +130,18 @@ def bq_load_photometry_for_provid(provid):
         "dry_run_bytes_processed": dry_bytes,
         "dry_run_bytes_human": bytes_to_human(dry_bytes) if dry_bytes else "—",
         "dry_run_est_cost_usd": est_usd_cost(dry_bytes) if dry_bytes else None,
+        "note": "BigQuery charges by bytes processed. USD estimate uses ~$5/TB (10^12 bytes).",
     }
 
+    # ---- Actual run ----
     run_config = bigquery.QueryJobConfig(
         query_parameters=params,
         use_query_cache=True,
     )
-
     job = client.query(query, job_config=run_config)
     df = job.to_dataframe()
 
     actual_bytes = int(getattr(job, "total_bytes_processed", 0) or 0)
-
     bq_meta.update({
         "actual_bytes_processed": actual_bytes if actual_bytes else None,
         "actual_bytes_human": bytes_to_human(actual_bytes) if actual_bytes else "—",
@@ -96,12 +150,6 @@ def bq_load_photometry_for_provid(provid):
     })
 
     return df, bq_meta
-    
-# -------------------------
-# Horizons config
-# -------------------------
-HORIZONS_LOCATION = "X05"
-HG_G_DEFAULT = 0.15
 
 
 # -------------------------
@@ -109,7 +157,7 @@ HG_G_DEFAULT = 0.15
 # -------------------------
 LSST_CANON = {"u", "g", "r", "i", "z", "y"}
 
-def normalize_lsst_band(x) -> str:
+def normalize_lsst_band(x):
     if x is None:
         return ""
     s = str(x).strip().lower()
@@ -118,7 +166,6 @@ def normalize_lsst_band(x) -> str:
     if len(s) == 2 and s[0] == "l" and s[1] in LSST_CANON:
         return s[1]
 
-    # allow 'lsstg' etc.
     m = re.match(r"^(?:lsst)?([ugrizy])$", s)
     if m:
         return m.group(1)
@@ -130,20 +177,20 @@ def normalize_lsst_band(x) -> str:
 # STEP 5 — Geometry correction using JPL Horizons (range query)
 # ======================================================================
 def step5_geometry_horizons_range(
-    df1: pd.DataFrame,
+    df1,
     *,
-    PROVID: str,
-    OUTDIR: str,
-    HORIZONS_LOCATION: str = "X05",
-    G_DEFAULT: float = 0.15,
-    STEP_MINUTES: int = 1,
-    PAD_MINUTES: int = 5,
-    FAIL_ON_UNMATCHED: bool = True,
-    TOL_DAYS: float | None = None,
-    show_plots: bool = False,
-    save_plots: bool = False,
-    save_tables: bool = False,
-    verbose: bool = False,
+    PROVID,
+    OUTDIR,
+    HORIZONS_LOCATION="X05",
+    G_DEFAULT=0.15,
+    STEP_MINUTES=1,
+    PAD_MINUTES=5,
+    FAIL_ON_UNMATCHED=True,
+    TOL_DAYS=None,
+    show_plots=False,
+    save_plots=False,
+    save_tables=False,
+    verbose=False,
 ):
     if df1 is None or len(df1) == 0:
         raise ValueError("STEP 5: df1 is empty.")
@@ -240,7 +287,6 @@ def step5_geometry_horizons_range(
 
     matched = int(dfM["r_au"].notna().sum())
     n_total = int(len(dfM))
-    match_frac = matched / max(1, n_total)
     n_unmatched = n_total - matched
 
     if n_unmatched > 0 and FAIL_ON_UNMATCHED:
@@ -288,7 +334,6 @@ def step5_geometry_horizons_range(
         "n_blocks": int(len(blocks)),
         "n_obs": int(n_total),
         "n_matched": int(matched),
-        "match_frac": float(match_frac),
         "n_unmatched": int(n_unmatched),
     }
 
@@ -296,22 +341,15 @@ def step5_geometry_horizons_range(
 
 
 # -------------------------
-# Helpers
+# More helpers
 # -------------------------
-@st.cache_data(show_spinner=False)
-def load_master(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    if "Designation" not in df.columns:
-        for c in ["provid", "PROVID", "designation", "name", "object_id"]:
-            if c in df.columns:
-                df = df.rename(columns={c: "Designation"})
-                break
-    return df
+def load_master(path):
+    return pd.read_csv(path)
 
-def safe_num(s: pd.Series) -> pd.Series:
+def safe_num(s):
     return pd.to_numeric(s, errors="coerce")
 
-def format_float(x, nd=6) -> str:
+def format_float(x, nd=6):
     try:
         v = float(x)
         if np.isfinite(v):
@@ -320,11 +358,11 @@ def format_float(x, nd=6) -> str:
         pass
     return "—"
 
-def reliability_short(rel: str) -> str:
+def reliability_short(rel):
     r = (rel or "").strip().lower()
     return r if r in {"reliable", "ambiguous", "insufficient"} else "unknown"
 
-def reliability_html(rel: str) -> str:
+def reliability_html(rel):
     r = reliability_short(rel)
     if r == "reliable":
         return '<span style="color:#22c55e;font-weight:800;">Reliable</span>'
@@ -334,7 +372,7 @@ def reliability_html(rel: str) -> str:
         return '<span style="color:#ef4444;font-weight:800;">Insufficient</span>'
     return '<span style="color:#64748b;font-weight:800;">Unknown</span>'
 
-def norm_id(x) -> str:
+def norm_id(x):
     if x is None:
         return ""
     s = str(x).strip().lower()
@@ -342,7 +380,7 @@ def norm_id(x) -> str:
         s = s.replace(ch, "")
     return s
 
-def resolve_nights(df: pd.DataFrame) -> int | None:
+def resolve_nights(df):
     for c in ["night", "night_id", "night_utc"]:
         if c in df.columns:
             s = df[c].astype(str)
@@ -354,17 +392,7 @@ def resolve_nights(df: pd.DataFrame) -> int | None:
             return int(dt.dt.date.nunique())
     return None
 
-def plot_fold(
-    ax,
-    t_hr: np.ndarray,
-    mag: np.ndarray,
-    bands: np.ndarray,
-    P_hr: float,
-    title: str,
-    mag_label: str,
-    *,
-    two_cycles: bool = False,
-):
+def plot_fold(ax, t_hr, mag, bands, P_hr, title, mag_label, two_cycles=False):
     phase = (t_hr / float(P_hr)) % 1.0
     uniq = sorted(np.unique(bands).tolist())
     for b in uniq:
@@ -372,106 +400,14 @@ def plot_fold(
         ax.scatter(phase[m], mag[m], s=10, label=str(b))
         if two_cycles:
             ax.scatter(phase[m] + 1.0, mag[m], s=10)
-
     ax.invert_yaxis()
     ax.set_xlabel("Phase (0–1)" if not two_cycles else "Phase (0–2)")
     ax.set_ylabel(mag_label)
     ax.set_title(title)
     ax.set_xlim(0.0, 2.0 if two_cycles else 1.0)
 
-def bytes_to_human(n: int) -> str:
-    # decimal units for BigQuery billing (TB = 10^12 bytes)
-    units = ["B", "KB", "MB", "GB", "TB", "PB"]
-    x = float(n)
-    for u in units:
-        if x < 1000.0 or u == units[-1]:
-            return f"{x:.2f} {u}"
-        x /= 1000.0
-    return f"{x:.2f} B"
 
-def est_usd_cost(bytes_processed: int) -> float:
-    tb = float(bytes_processed) / 1e12
-    return tb * float(BQ_USD_PER_TB)
-
-
-# -------------------------
-# BigQuery (Streamlit Cloud safe)
-# -------------------------
-@st.cache_resource
-def get_bq_client() -> bigquery.Client:
-    if "gcp_service_account" not in st.secrets:
-        st.error("Missing Streamlit secret: [gcp_service_account].")
-        st.stop()
-    sa = dict(st.secrets["gcp_service_account"])
-    if ("client_email" not in sa) or ("private_key" not in sa):
-        st.error("Your [gcp_service_account] secret is incomplete.")
-        st.stop()
-    creds = service_account.Credentials.from_service_account_info(sa)
-    return bigquery.Client(project=BQ_PROJECT, credentials=creds)
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def bq_load_photometry_for_provid(provid: str) -> tuple[pd.DataFrame, dict]:
-    """
-    Returns:
-      df_raw: photometry rows
-      bq_meta: diagnostics incl. dry-run bytes, est cost, actual bytes (if available)
-    """
-    client = get_bq_client()
-
-    # NOTE: removing SAFE_CAST in WHERE can help optimizations; cast in Python.
-    q = f"""
-    SELECT
-      provid,
-      obstime,
-      band,
-      SAFE_CAST(mag AS FLOAT64)    AS mag,
-      SAFE_CAST(rmsmag AS FLOAT64) AS rmsmag
-    FROM `{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`
-    WHERE stn = @stn
-      AND provid = @prov
-      AND mag IS NOT NULL
-    ORDER BY obstime
-    LIMIT {int(BQ_ROW_LIMIT)}
-    """
-
-    params = [
-        bigquery.ScalarQueryParameter("stn", "STRING", BQ_STN),
-        bigquery.ScalarQueryParameter("prov", "STRING", provid),
-    ]
-
-    # ---- Dry run (estimate bytes) ----
-    dry_cfg = bigquery.QueryJobConfig(
-        query_parameters=params,
-        dry_run=True,
-        use_query_cache=False,
-    )
-    dry_job = client.query(q, job_config=dry_cfg)
-    dry_bytes = int(getattr(dry_job, "total_bytes_processed", 0) or 0)
-
-    bq_meta: dict = {
-        "provid": provid,
-        "dry_run_bytes_processed": dry_bytes,
-        "dry_run_bytes_human": bytes_to_human(dry_bytes) if dry_bytes else "—",
-        "dry_run_est_cost_usd": est_usd_cost(dry_bytes) if dry_bytes else None,
-        "note": "BigQuery charges by bytes processed. USD estimate uses ~$5/TB (10^12 bytes). Your billing currency may differ.",
-    }
-
-    # ---- Actual run ----
-    run_cfg = bigquery.QueryJobConfig(query_parameters=params)
-    job = client.query(q, job_config=run_cfg)
-    df = job.to_dataframe()
-
-    actual_bytes = int(getattr(job, "total_bytes_processed", 0) or 0)
-    bq_meta.update({
-        "actual_bytes_processed": actual_bytes if actual_bytes else None,
-        "actual_bytes_human": bytes_to_human(actual_bytes) if actual_bytes else "—",
-        "actual_est_cost_usd": est_usd_cost(actual_bytes) if actual_bytes else None,
-        "cache_hit": bool(getattr(job, "cache_hit", False)),
-    })
-
-    return df, bq_meta
-
-def make_df1_from_bq(df_raw: pd.DataFrame) -> pd.DataFrame:
+def make_df1_from_bq(df_raw):
     df = df_raw.copy()
     df["obstime_dt"] = pd.to_datetime(df["obstime"], errors="coerce", utc=True)
     df["mag"] = pd.to_numeric(df["mag"], errors="coerce")
@@ -487,8 +423,8 @@ def make_df1_from_bq(df_raw: pd.DataFrame) -> pd.DataFrame:
     df["night_utc"] = df["obstime_dt"].dt.strftime("%Y-%m-%d")
     return df
 
-@st.cache_data(show_spinner=False, ttl=24*3600)
-def geo_correct_cached(df1: pd.DataFrame, provid: str) -> tuple[pd.DataFrame, dict]:
+
+def geo_correct_cached(df1, provid):
     df_geo, meta = step5_geometry_horizons_range(
         df1,
         PROVID=provid,
@@ -515,6 +451,14 @@ if not MASTER_PATH.exists():
 
 master = load_master(MASTER_PATH)
 
+# If your master has a different column name, rename to "Designation"
+if "Designation" not in master.columns:
+    for c in ["provid", "PROVID", "designation", "name", "object_id"]:
+        if c in master.columns:
+            master = master.rename(columns={c: "Designation"})
+            break
+
+# Convert numeric columns if present (optional)
 NUM_COLS = [
     "H Mag", "Mean Mag (r Band)", "Number of Observations", "Arc (days)",
     "LS peak period (hr)", "Adopted period (hr)", "Adopted K",
@@ -526,17 +470,16 @@ for c in NUM_COLS:
     if c in master.columns:
         master[c] = safe_num(master[c])
 
-# -------------------------
-# Precompute reliable count (for label)
-# -------------------------
+# Reliable count label
 if "Reliability" in master.columns:
     _rel_short_all = master["Reliability"].astype(str).map(reliability_short)
     RELIABLE_COUNT = int((_rel_short_all == "reliable").sum())
 else:
     RELIABLE_COUNT = 0
 
+
 # -------------------------
-# Sidebar: Mode (TOP-LEVEL)
+# Sidebar + layout
 # -------------------------
 st.sidebar.markdown("## Mode")
 mode = st.sidebar.radio("View", ["Asteroid Viewer", "Population Explorer"], index=0)
@@ -647,9 +590,8 @@ if mode == "Asteroid Viewer":
         with st.spinner("Querying BigQuery photometry (minimal columns) ..."):
             df_raw, bq_meta = bq_load_photometry_for_provid(str(selected))
 
-        # ---- Where you will SEE the cost ----
         with st.expander("BigQuery Cost & Query Diagnostics", expanded=False):
-            st.write("These numbers update per asteroid selection. If bytes are huge (GB–TB), the query is scanning too much.")
+            st.write("If bytes are huge (GB–TB), the query is scanning too much.")
             st.json(bq_meta)
 
         if df_raw is None or len(df_raw) == 0:
@@ -899,10 +841,3 @@ else:
         mime="text/csv",
         use_container_width=True,
     )
-
-
-
-
-
-
-
