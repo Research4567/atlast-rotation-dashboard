@@ -1,8 +1,12 @@
 # -------------------------
-# BigQuery (Streamlit Cloud safe) — NO decorator caching (version-proof)
+# BigQuery (Streamlit Cloud safe) — no decorator caching
 # -------------------------
-def get_bq_client() -> bigquery.Client:
-    # Cache the client in session_state (works in all Streamlit versions)
+
+def get_bq_client():
+    """
+    Create and cache a BigQuery client using Streamlit session_state.
+    Works across all Streamlit versions.
+    """
     if "_bq_client" in st.session_state:
         return st.session_state["_bq_client"]
 
@@ -11,6 +15,7 @@ def get_bq_client() -> bigquery.Client:
         st.stop()
 
     sa = dict(st.secrets["gcp_service_account"])
+
     if ("client_email" not in sa) or ("private_key" not in sa):
         st.error("Your [gcp_service_account] secret is incomplete.")
         st.stop()
@@ -23,17 +28,22 @@ def get_bq_client() -> bigquery.Client:
 
 
 def bq_load_photometry_for_provid(
-    provid: str,
-    *,
-    dataset: str = BQ_DATASET,
-    table: str = BQ_TABLE,
-    stn: str = BQ_STN,
-    row_limit: int = BQ_ROW_LIMIT,
-) -> tuple[pd.DataFrame, dict]:
+    provid,
+    dataset=BQ_DATASET,
+    table=BQ_TABLE,
+    stn=BQ_STN,
+    row_limit=BQ_ROW_LIMIT,
+):
+    """
+    Returns:
+        df_raw  -> photometry DataFrame
+        bq_meta -> cost diagnostics dictionary
+    """
+
     client = get_bq_client()
     source_table = f"{BQ_PROJECT}.{dataset}.{table}"
 
-    q = f"""
+    query = f"""
     SELECT
       provid,
       obstime,
@@ -53,33 +63,40 @@ def bq_load_photometry_for_provid(
         bigquery.ScalarQueryParameter("prov", "STRING", provid),
     ]
 
-    # ---- Dry run (estimate bytes processed) ----
-    dry_cfg = bigquery.QueryJobConfig(
+    # -------------------------
+    # Dry run (estimate bytes)
+    # -------------------------
+    dry_config = bigquery.QueryJobConfig(
         query_parameters=params,
         dry_run=True,
         use_query_cache=False,
     )
-    dry_job = client.query(q, job_config=dry_cfg)
+
+    dry_job = client.query(query, job_config=dry_config)
     dry_bytes = int(getattr(dry_job, "total_bytes_processed", 0) or 0)
 
-    bq_meta: dict = {
+    bq_meta = {
         "provid": provid,
         "source_table": source_table,
         "dry_run_bytes_processed": dry_bytes,
         "dry_run_bytes_human": bytes_to_human(dry_bytes) if dry_bytes else "—",
         "dry_run_est_cost_usd": est_usd_cost(dry_bytes) if dry_bytes else None,
-        "note": "BigQuery charges by bytes processed. USD estimate uses ~$5/TB (10^12 bytes). Your billing currency may differ.",
+        "note": "BigQuery charges by bytes processed. USD estimate uses ~$5/TB (10^12 bytes).",
     }
 
-    # ---- Actual run ----
-    run_cfg = bigquery.QueryJobConfig(
+    # -------------------------
+    # Actual query execution
+    # -------------------------
+    run_config = bigquery.QueryJobConfig(
         query_parameters=params,
         use_query_cache=True,
     )
-    job = client.query(q, job_config=run_cfg)
+
+    job = client.query(query, job_config=run_config)
     df = job.to_dataframe()
 
     actual_bytes = int(getattr(job, "total_bytes_processed", 0) or 0)
+
     bq_meta.update({
         "actual_bytes_processed": actual_bytes if actual_bytes else None,
         "actual_bytes_human": bytes_to_human(actual_bytes) if actual_bytes else "—",
@@ -891,6 +908,7 @@ else:
         mime="text/csv",
         use_container_width=True,
     )
+
 
 
 
