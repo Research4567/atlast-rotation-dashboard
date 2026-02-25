@@ -8,7 +8,10 @@
 # 1) "reliable_only" Session State conflict fixed:
 #    - default set once BEFORE widget
 #    - checkbox does NOT pass value=
-# 2) BigQuery Forbidden on Streamlit Cloud fixed in the common case:
+# 2) BigQuery Forbidden on Streamlit Cloud: add HARDENING + DEBUG:
+#    - client smoke-test (SELECT 1)
+#    - DRY RUN first (better error surface + bytes estimate)
+#    - robust exception handler that prints job.errors / error_result
 #    - df = job.to_dataframe(create_bqstorage_client=False)
 # 3) BigQuery client built from st.secrets service account and pinned project
 # ==========================================================
@@ -25,6 +28,7 @@ import matplotlib.pyplot as plt
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
+from google.api_core.exceptions import Forbidden, BadRequest, NotFound
 
 from astropy.time import Time
 from astroquery.jplhorizons import Horizons
@@ -104,8 +108,29 @@ def get_bq_client():
     # Pin the project so billing + job creation are consistent
     client = bigquery.Client(project=BQ_PROJECT, credentials=creds)
 
+    # Smoke-test: can this SA create jobs at all?
+    try:
+        _ = client.query("SELECT 1", location=BQ_LOCATION).result()
+    except Exception as e:
+        st.error("BigQuery client smoke-test failed (cannot run SELECT 1).")
+        st.exception(e)
+        st.stop()
+
     st.session_state["_bq_client"] = client
     return client
+
+
+def _bq_job_debug_dict(job):
+    return {
+        "job_id": getattr(job, "job_id", None),
+        "project": getattr(job, "project", None),
+        "location": BQ_LOCATION,
+        "state": getattr(job, "state", None),
+        "errors": getattr(job, "errors", None),
+        "error_result": getattr(job, "error_result", None),
+        "cache_hit": bool(getattr(job, "cache_hit", False)),
+        "total_bytes_processed": int(getattr(job, "total_bytes_processed", 0) or 0),
+    }
 
 
 def bq_load_photometry_for_provid(provid):
@@ -132,26 +157,58 @@ def bq_load_photometry_for_provid(provid):
         bigquery.ScalarQueryParameter("prov", "STRING", provid),
     ]
 
-    # ---- Dry run skipped to avoid NotFound / location / permission issues ----
     bq_meta = {
         "provid": provid,
         "source_table": source_table,
         "location": BQ_LOCATION,
-        "dry_run_skipped": True,
-        "note": "Dry-run skipped. Using actual bytes from executed query.",
     }
 
-    # ---- Actual run ----
-    run_config = bigquery.QueryJobConfig(
+    # ---- DRY RUN FIRST (best error surface + bytes estimate) ----
+    try:
+        dry_cfg = bigquery.QueryJobConfig(
+            query_parameters=params,
+            dry_run=True,
+            use_query_cache=False,
+        )
+        dry_job = client.query(query, job_config=dry_cfg, location=BQ_LOCATION)
+        est_bytes = int(getattr(dry_job, "total_bytes_processed", 0) or 0)
+        bq_meta.update({
+            "dry_run_ok": True,
+            "estimated_bytes_processed": est_bytes if est_bytes else None,
+            "estimated_bytes_human": bytes_to_human(est_bytes) if est_bytes else "—",
+            "estimated_est_cost_usd": est_usd_cost(est_bytes) if est_bytes else None,
+        })
+    except Exception as e:
+        bq_meta.update({"dry_run_ok": False})
+        st.error("BigQuery DRY RUN failed (permissions/location/table access).")
+        st.json(bq_meta)
+        st.exception(e)
+        raise
+
+    # ---- ACTUAL RUN ----
+    run_cfg = bigquery.QueryJobConfig(
         query_parameters=params,
         use_query_cache=True,
     )
 
-    # IMPORTANT: pass location
-    job = client.query(query, job_config=run_config, location=BQ_LOCATION)
+    job = client.query(query, job_config=run_cfg, location=BQ_LOCATION)
 
-    # IMPORTANT (Streamlit Cloud): avoid BigQuery Storage API permission issues
-    df = job.to_dataframe(create_bqstorage_client=False)
+    try:
+        # IMPORTANT (Streamlit Cloud): avoid BigQuery Storage API permission issues
+        df = job.to_dataframe(create_bqstorage_client=False)
+    except (Forbidden, BadRequest, NotFound) as e:
+        bq_meta.update({"job_debug": _bq_job_debug_dict(job)})
+        st.error(
+            "BigQuery query failed.\n\n"
+            "Common causes:\n"
+            "• Missing IAM: BigQuery Job User (jobs.create)\n"
+            "• Missing IAM: BigQuery Data Viewer (tables.getData)\n"
+            "• Dataset location mismatch (US vs EU)\n"
+            "• Authorized view / row-level security blocking access\n"
+        )
+        st.json(bq_meta)
+        st.exception(e)
+        raise
 
     actual_bytes = int(getattr(job, "total_bytes_processed", 0) or 0)
     bq_meta.update({
