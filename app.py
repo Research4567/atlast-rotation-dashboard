@@ -1,3 +1,18 @@
+# app.py
+# ==========================================================
+# ATLAST Asteroid Rotation Dashboard
+# Photometry is queried from BigQuery per asteroid and folded using
+# on-the-fly geometry correction (Horizons).
+#
+# FIXES INCLUDED (per your error + warning):
+# 1) "reliable_only" Session State conflict fixed:
+#    - default set once BEFORE widget
+#    - checkbox does NOT pass value=
+# 2) BigQuery Forbidden on Streamlit Cloud fixed in the common case:
+#    - df = job.to_dataframe(create_bqstorage_client=False)
+# 3) BigQuery client built from st.secrets service account and pinned project
+# ==========================================================
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -86,6 +101,7 @@ def get_bq_client():
         st.stop()
 
     creds = service_account.Credentials.from_service_account_info(sa)
+    # Pin the project so billing + job creation are consistent
     client = bigquery.Client(project=BQ_PROJECT, credentials=creds)
 
     st.session_state["_bq_client"] = client
@@ -133,7 +149,9 @@ def bq_load_photometry_for_provid(provid):
 
     # IMPORTANT: pass location
     job = client.query(query, job_config=run_config, location=BQ_LOCATION)
-    df = job.to_dataframe()
+
+    # IMPORTANT (Streamlit Cloud): avoid BigQuery Storage API permission issues
+    df = job.to_dataframe(create_bqstorage_client=False)
 
     actual_bytes = int(getattr(job, "total_bytes_processed", 0) or 0)
     bq_meta.update({
@@ -141,9 +159,11 @@ def bq_load_photometry_for_provid(provid):
         "actual_bytes_human": bytes_to_human(actual_bytes) if actual_bytes else "—",
         "actual_est_cost_usd": est_usd_cost(actual_bytes) if actual_bytes else None,
         "cache_hit": bool(getattr(job, "cache_hit", False)),
+        "job_id": getattr(job, "job_id", None),
     })
 
     return df, bq_meta
+
 
 # -------------------------
 # Band normalization
@@ -399,7 +419,6 @@ def plot_fold(ax, t_hr, mag, bands, P_hr, title, mag_label, two_cycles=False):
     ax.set_title(title)
     ax.set_xlim(0.0, 2.0 if two_cycles else 1.0)
 
-
 def make_df1_from_bq(df_raw):
     df = df_raw.copy()
     df["obstime_dt"] = pd.to_datetime(df["obstime"], errors="coerce", utc=True)
@@ -415,7 +434,6 @@ def make_df1_from_bq(df_raw):
     df["t_hr"] = (df["obstime_dt"] - t0).dt.total_seconds() / 3600.0
     df["night_utc"] = df["obstime_dt"].dt.strftime("%Y-%m-%d")
     return df
-
 
 def geo_correct_cached(df1, provid):
     df_geo, meta = step5_geometry_horizons_range(
@@ -489,18 +507,18 @@ if mode == "Asteroid Viewer":
     st.sidebar.markdown("---")
     st.sidebar.markdown("## Asteroid")
 
+    # IMPORTANT: set default once, BEFORE widget, and never pass value= later
     if "reliable_only" not in st.session_state:
         st.session_state["reliable_only"] = True
 
     q = st.sidebar.text_input("Search Designation", value="", placeholder="E.g., 2025 ME69")
 
-    reliable_only_state = bool(st.session_state.get("reliable_only", False))
     df_pick = master.copy()
 
     if q.strip():
         df_pick = df_pick[df_pick["Designation"].astype(str).str.contains(q.strip(), case=False, na=False)]
 
-    if reliable_only_state and ("Reliability" in df_pick.columns):
+    if bool(st.session_state.get("reliable_only", False)) and ("Reliability" in df_pick.columns):
         rel_s = df_pick["Reliability"].astype(str).map(reliability_short)
         df_pick = df_pick[rel_s == "reliable"]
 
@@ -508,8 +526,11 @@ if mode == "Asteroid Viewer":
     designations = df_pick["Designation"].astype(str).tolist()
 
     if not designations:
-        st.sidebar.warning("No asteroids match your current search." if not reliable_only_state
-                           else "No reliable-period asteroids match your current search.")
+        st.sidebar.warning(
+            "No reliable-period asteroids match your current search."
+            if bool(st.session_state.get("reliable_only", False))
+            else "No asteroids match your current search."
+        )
         st.stop()
 
     selected = st.sidebar.selectbox(
@@ -519,12 +540,13 @@ if mode == "Asteroid Viewer":
         key="selected_asteroid",
     )
 
+    # Checkbox AFTER selectbox is OK; no value= passed to avoid warning.
     st.sidebar.checkbox(
         f"Reliable Periods only ({RELIABLE_COUNT:,})",
-        value=reliable_only_state,
         key="reliable_only",
     )
 
+    # If user turned on reliable_only and current selection is no longer valid:
     if bool(st.session_state.get("reliable_only", False)) and (selected not in designations):
         st.session_state.selected_asteroid = designations[0]
         st.rerun()
@@ -834,13 +856,3 @@ else:
         mime="text/csv",
         use_container_width=True,
     )
-
-
-
-
-
-
-
-
-
-
