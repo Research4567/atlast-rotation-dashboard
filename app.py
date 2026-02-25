@@ -52,17 +52,16 @@ MASTER_PATH = Path("master_results_clean.csv")  # required
 
 
 # -------------------------
-# BigQuery config
+# BigQuery config (YOUR OWN MATERIALIZED X05 TABLE)
 # -------------------------
-BQ_PROJECT = "lsst-484623"
-BQ_LOCATION = "US"  # change to "EU" if the dataset Details says EU
-BQ_DATASET = "atlast_photometry"        # <-- YOUR OWN dataset
-BQ_TABLE   = "public_obs_x05"           # <-- YOUR OWN X05-only table
+BQ_PROJECT  = "lsst-484623"
+BQ_LOCATION = "US"
+BQ_DATASET  = "atlast_photometry"
+BQ_TABLE    = "public_obs_x05"
 BQ_ROW_LIMIT = 20000
 
 # BigQuery on-demand analysis pricing ballpark:
 BQ_USD_PER_TB = 5.0  # USD / TB (10^12 bytes)
-
 
 # -------------------------
 # Horizons config
@@ -138,7 +137,6 @@ def bq_load_photometry_for_provid(provid):
     client = get_bq_client()
     source_table = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
 
-    # Table is already X05-only. Only filter by provid.
     query = f"""
     SELECT
       provid,
@@ -157,6 +155,7 @@ def bq_load_photometry_for_provid(provid):
         bigquery.ScalarQueryParameter("prov", "STRING", provid),
     ]
 
+ 
     bq_meta = {
         "provid": provid,
         "source_table": source_table,
@@ -912,3 +911,4 @@ else:
         mime="text/csv",
         use_container_width=True,
     )
+
