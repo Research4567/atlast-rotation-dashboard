@@ -8,12 +8,14 @@
 # 1) "reliable_only" Session State conflict fixed:
 #    - default set once BEFORE widget
 #    - checkbox does NOT pass value=
-# 2) BigQuery Forbidden on Streamlit Cloud: add HARDENING + DEBUG:
+# 2) BigQuery Hardened + Debug:
 #    - client smoke-test (SELECT 1)
 #    - DRY RUN first (better error surface + bytes estimate)
 #    - robust exception handler that prints job.errors / error_result
 #    - df = job.to_dataframe(create_bqstorage_client=False)
-# 3) BigQuery client built from st.secrets service account and pinned project
+# 3) Uses your OWN materialized X05 table (cheap + no upstream permission issues):
+#    - lsst-484623.atlast_photometry.public_obs_x05
+#    - stn filter removed (table is already X05-only)
 # ==========================================================
 
 from __future__ import annotations
@@ -54,9 +56,8 @@ MASTER_PATH = Path("master_results_clean.csv")  # required
 # -------------------------
 BQ_PROJECT = "lsst-484623"
 BQ_LOCATION = "US"  # change to "EU" if the dataset Details says EU
-BQ_DATASET = "asteroid_institute___mpc_replica_views"  # <-- DOUBLE underscore
-BQ_TABLE   = "public_obs_sbn_clustered"
-BQ_STN     = "X05"
+BQ_DATASET = "atlast_photometry"        # <-- YOUR OWN dataset
+BQ_TABLE   = "public_obs_x05"           # <-- YOUR OWN X05-only table
 BQ_ROW_LIMIT = 20000
 
 # BigQuery on-demand analysis pricing ballpark:
@@ -137,6 +138,7 @@ def bq_load_photometry_for_provid(provid):
     client = get_bq_client()
     source_table = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
 
+    # Table is already X05-only. Only filter by provid.
     query = f"""
     SELECT
       provid,
@@ -145,15 +147,13 @@ def bq_load_photometry_for_provid(provid):
       SAFE_CAST(mag AS FLOAT64)    AS mag,
       SAFE_CAST(rmsmag AS FLOAT64) AS rmsmag
     FROM `{source_table}`
-    WHERE stn = @stn
-      AND provid = @prov
+    WHERE provid = @prov
       AND mag IS NOT NULL
     ORDER BY obstime
     LIMIT {int(BQ_ROW_LIMIT)}
     """
 
     params = [
-        bigquery.ScalarQueryParameter("stn", "STRING", BQ_STN),
         bigquery.ScalarQueryParameter("prov", "STRING", provid),
     ]
 
@@ -204,7 +204,6 @@ def bq_load_photometry_for_provid(provid):
             "• Missing IAM: BigQuery Job User (jobs.create)\n"
             "• Missing IAM: BigQuery Data Viewer (tables.getData)\n"
             "• Dataset location mismatch (US vs EU)\n"
-            "• Authorized view / row-level security blocking access\n"
         )
         st.json(bq_meta)
         st.exception(e)
@@ -667,7 +666,7 @@ if mode == "Asteroid Viewer":
             st.json(bq_meta)
 
         if df_raw is None or len(df_raw) == 0:
-            st.info("No photometry rows found in BigQuery for this asteroid (stn filter + provid match).")
+            st.info("No photometry rows found in BigQuery for this asteroid (provid match).")
             st.stop()
 
         df1 = make_df1_from_bq(df_raw)
