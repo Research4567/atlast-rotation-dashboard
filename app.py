@@ -4,18 +4,13 @@
 # Photometry is queried from BigQuery per asteroid and folded using
 # on-the-fly geometry correction (Horizons).
 #
-# FIXES INCLUDED (per your error + warning):
-# 1) "reliable_only" Session State conflict fixed:
-#    - default set once BEFORE widget
-#    - checkbox does NOT pass value=
-# 2) BigQuery Hardened + Debug:
-#    - client smoke-test (SELECT 1)
-#    - DRY RUN first (better error surface + bytes estimate)
-#    - robust exception handler that prints job.errors / error_result
-#    - df = job.to_dataframe(create_bqstorage_client=False)
-# 3) Uses your OWN materialized X05 table (cheap + no upstream permission issues):
-#    - lsst-484623.atlast_photometry.public_obs_x05
-#    - stn filter removed (table is already X05-only)
+# UPDATES INCLUDED (per your request):
+# - BigQuery query: remove ORDER BY (cheaper) + sort in pandas instead
+# - Remove UI: "Download Photometry CSV" button
+# - Remove UI: "Geometry Correction QA (Step 5 meta)" expander
+# - Magnitude-vs-time x-axis: use DAYS since first observation (better for multi-year LSST)
+# - Text/axis wording: "Adopted Period (Hr)" -> "Adopted Period (hours)" everywhere
+# - Population plot title: "Rotation Period vs Amplitude"
 # ==========================================================
 
 from __future__ import annotations
@@ -91,7 +86,6 @@ def est_usd_cost(bytes_processed):
 # BigQuery (Streamlit Cloud safe) — no decorator caching
 # -------------------------
 def get_bq_client():
-    # Cache the client in session_state (works in all Streamlit versions)
     if "_bq_client" in st.session_state:
         return st.session_state["_bq_client"]
 
@@ -105,7 +99,6 @@ def get_bq_client():
         st.stop()
 
     creds = service_account.Credentials.from_service_account_info(sa)
-    # Pin the project so billing + job creation are consistent
     client = bigquery.Client(project=BQ_PROJECT, credentials=creds)
 
     # Smoke-test: can this SA create jobs at all?
@@ -137,6 +130,7 @@ def bq_load_photometry_for_provid(provid):
     client = get_bq_client()
     source_table = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
 
+    # NOTE: No ORDER BY (cheaper). We sort in pandas after fetching.
     query = f"""
     SELECT
       provid,
@@ -147,7 +141,6 @@ def bq_load_photometry_for_provid(provid):
     FROM `{source_table}`
     WHERE provid = @prov
       AND mag IS NOT NULL
-    ORDER BY obstime
     LIMIT {int(BQ_ROW_LIMIT)}
     """
 
@@ -155,14 +148,13 @@ def bq_load_photometry_for_provid(provid):
         bigquery.ScalarQueryParameter("prov", "STRING", provid),
     ]
 
- 
     bq_meta = {
         "provid": provid,
         "source_table": source_table,
         "location": BQ_LOCATION,
     }
 
-    # ---- DRY RUN FIRST (best error surface + bytes estimate) ----
+    # ---- DRY RUN FIRST ----
     try:
         dry_cfg = bigquery.QueryJobConfig(
             query_parameters=params,
@@ -189,11 +181,9 @@ def bq_load_photometry_for_provid(provid):
         query_parameters=params,
         use_query_cache=True,
     )
-
     job = client.query(query, job_config=run_cfg, location=BQ_LOCATION)
 
     try:
-        # IMPORTANT (Streamlit Cloud): avoid BigQuery Storage API permission issues
         df = job.to_dataframe(create_bqstorage_client=False)
     except (Forbidden, BadRequest, NotFound) as e:
         bq_meta.update({"job_debug": _bq_job_debug_dict(job)})
@@ -230,7 +220,6 @@ def normalize_lsst_band(x):
         return ""
     s = str(x).strip().lower()
 
-    # common in some exports: 'lg','lr','li','lu','lz','ly' -> 'g','r','i','u','z','y'
     if len(s) == 2 and s[0] == "l" and s[1] in LSST_CANON:
         return s[1]
 
@@ -481,14 +470,21 @@ def make_df1_from_bq(df_raw):
     df["rmsmag"] = pd.to_numeric(df.get("rmsmag", np.nan), errors="coerce")
     df["band"] = df.get("band", "x").map(normalize_lsst_band)
 
-    df = df.dropna(subset=["obstime_dt", "mag", "band"]).sort_values("obstime_dt").reset_index(drop=True)
+    df = df.dropna(subset=["obstime_dt", "mag", "band"]).reset_index(drop=True)
+
+    # Sort in pandas (since BigQuery query has no ORDER BY)
+    if "obstime_dt" in df.columns:
+        df = df.sort_values("obstime_dt")
+
     if len(df) == 0:
         return df
 
     t0 = df["obstime_dt"].min()
     df["t_hr"] = (df["obstime_dt"] - t0).dt.total_seconds() / 3600.0
+    df["t_day"] = (df["obstime_dt"] - t0).dt.total_seconds() / 86400.0
     df["night_utc"] = df["obstime_dt"].dt.strftime("%Y-%m-%d")
     return df
+
 
 def geo_correct_cached(df1, provid):
     df_geo, meta = step5_geometry_horizons_range(
@@ -562,7 +558,6 @@ if mode == "Asteroid Viewer":
     st.sidebar.markdown("---")
     st.sidebar.markdown("## Asteroid")
 
-    # IMPORTANT: set default once, BEFORE widget, and never pass value= later
     if "reliable_only" not in st.session_state:
         st.session_state["reliable_only"] = True
 
@@ -595,13 +590,11 @@ if mode == "Asteroid Viewer":
         key="selected_asteroid",
     )
 
-    # Checkbox AFTER selectbox is OK; no value= passed to avoid warning.
     st.sidebar.checkbox(
         f"Reliable Periods only ({RELIABLE_COUNT:,})",
         key="reliable_only",
     )
 
-    # If user turned on reliable_only and current selection is no longer valid:
     if bool(st.session_state.get("reliable_only", False)) and (selected not in designations):
         st.session_state.selected_asteroid = designations[0]
         st.rerun()
@@ -625,7 +618,7 @@ if mode == "Asteroid Viewer":
     hi = float(P_adopt) * 2.0
 
     P_calc = st.sidebar.slider(
-        "Fold Period (Hr)",
+        "Fold Period (hours)",
         min_value=float(lo),
         max_value=float(hi),
         value=float(st.session_state.fold_period),
@@ -717,22 +710,12 @@ if mode == "Asteroid Viewer":
 
         st.caption(f"Folding uses: **{mag_label}**")
 
-        st.download_button(
-            "Download Photometry CSV",
-            data=df_geo.to_csv(index=False).encode("utf-8"),
-            file_name=f"{norm_id(selected)}_photometry_geo.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-        with st.expander("Geometry Correction QA (Step 5 meta)", expanded=False):
-            st.json(meta5)
-
         if len(dfp) < 5:
             st.warning("Very few points remain after band filtering. Try selecting more bands.")
             st.stop()
 
         t_hr = dfp["t_hr"].to_numpy(float)
+        t_day = dfp["t_day"].to_numpy(float) if "t_day" in dfp.columns else (t_hr / 24.0)
         mag = pd.to_numeric(dfp[mag_col], errors="coerce").to_numpy(float)
         bands = dfp["band"].to_numpy(str)
 
@@ -742,7 +725,7 @@ if mode == "Asteroid Viewer":
         st.markdown("#### Three-Panel Fold (P/2 • P • 2P)")
         cols = st.columns(3)
         periods = [P_half, float(P_calc), P_two]
-        titles = [f"P/2 = {P_half:.6f} Hr", f"P = {float(P_calc):.6f} Hr", f"2P = {P_two:.6f} Hr"]
+        titles = [f"P/2 = {P_half:.6f} hours", f"P = {float(P_calc):.6f} hours", f"2P = {P_two:.6f} hours"]
 
         for col, P_hr, title in zip(cols, periods, titles):
             with col:
@@ -764,9 +747,9 @@ if mode == "Asteroid Viewer":
         fig, ax = plt.subplots(figsize=(10.5, 3.6))
         for b in sorted(np.unique(bands).tolist()):
             m = (bands == b)
-            ax.scatter(t_hr[m], mag[m], s=10, label=b)
+            ax.scatter(t_day[m], mag[m], s=10, label=b)
         ax.invert_yaxis()
-        ax.set_xlabel("Hours Since First Observation")
+        ax.set_xlabel("Days Since First Observation")
         ax.set_ylabel(mag_label)
         ax.set_title("Magnitude vs Time")
         ax.legend(fontsize=8, ncol=6)
@@ -786,7 +769,7 @@ if mode == "Asteroid Viewer":
         k4.metric("Axial Elongation", format_float(row.get("Axial Elongation", np.nan), 3))
 
         b1, b2, b3 = st.columns(3)
-        b1.metric("2P Candidate (Hr)", format_float(row.get("2P candidate (hr)", np.nan), 6))
+        b1.metric("2P Candidate (hours)", format_float(row.get("2P candidate (hr)", np.nan), 6))
         b2.metric("ΔBIC(2P−P)", format_float(row.get("ΔBIC(2P−P)", np.nan), 3))
         b3.metric("Bootstrap Top_Frac", format_float(row.get("Bootstrap top_frac", np.nan), 3))
 
@@ -818,7 +801,7 @@ else:
     pmin = float(np.nanmin(master[p_col])) if (p_col in master.columns and master[p_col].notna().any()) else 0.0
     pmax = float(np.nanmax(master[p_col])) if (p_col in master.columns and master[p_col].notna().any()) else 100.0
     p_lo, p_hi = st.sidebar.slider(
-        "Adopted Period Range (Hr)",
+        "Adopted Period Range (hours)",
         min_value=float(max(0.0, pmin)),
         max_value=float(max(1.0, pmax)),
         value=(float(max(0.0, pmin)), float(max(1.0, pmax))),
@@ -861,7 +844,7 @@ else:
         c4.metric("Insufficient", "—")
 
     if "Adopted period (hr)" in df_f.columns and "Amplitude (Fourier)" in df_f.columns:
-        st.markdown("#### Period vs Amplitude")
+        st.markdown("#### Rotation Period vs Amplitude")
         x = df_f["Adopted period (hr)"].to_numpy(float)
         y = df_f["Amplitude (Fourier)"].to_numpy(float)
         m = np.isfinite(x) & np.isfinite(y)
@@ -870,9 +853,9 @@ else:
         else:
             fig, ax = plt.subplots(figsize=(8.5, 4.5))
             ax.scatter(x[m], y[m], s=10)
-            ax.set_xlabel("Adopted Period (Hr)")
+            ax.set_xlabel("Adopted Period (hours)")
             ax.set_ylabel("Amplitude (Fourier, Mag)")
-            ax.set_title("Period vs Amplitude (Filtered)")
+            ax.set_title("Rotation Period vs Amplitude")
             st.pyplot(fig, clear_figure=True)
 
     if "Adopted period (hr)" in df_f.columns:
@@ -884,7 +867,7 @@ else:
         else:
             fig, ax = plt.subplots(figsize=(8.5, 4.0))
             ax.hist(periods, bins=50)
-            ax.set_xlabel("Adopted Period (Hr)")
+            ax.set_xlabel("Adopted Period (hours)")
             ax.set_ylabel("Count")
             ax.set_title("Adopted Period Histogram")
             st.pyplot(fig, clear_figure=True)
@@ -911,4 +894,3 @@ else:
         mime="text/csv",
         use_container_width=True,
     )
-
