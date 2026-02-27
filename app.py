@@ -1,16 +1,14 @@
 # app.py
 # ==========================================================
 # ATLAST Asteroid Rotation Dashboard
-# Photometry is queried from BigQuery per asteroid and folded using
-# on-the-fly geometry correction (Horizons).
+# Photometry queried from your LOCAL BigQuery table and folded with
+# on-the-fly geometry correction (JPL Horizons).
 #
-# UPDATES INCLUDED (per your request):
-# - BigQuery query: remove ORDER BY (cheaper) + sort in pandas instead
-# - Remove UI: "Download Photometry CSV" button
-# - Remove UI: "Geometry Correction QA (Step 5 meta)" expander
-# - Magnitude-vs-time x-axis: use DAYS since first observation (better for multi-year LSST)
-# - Text/axis wording: "Adopted Period (Hr)" -> "Adopted Period (hours)" everywhere
-# - Population plot title: "Rotation Period vs Amplitude"
+# Key design choices (2026-02-27 republish):
+# - Uses your local, partitioned table: lsst-484623.atlast_photometry.public_obs_x05
+# - Adds partition-pruning time window on obstime (cheap + predictable)
+# - Restores ORDER BY obstime (safe after pruning)
+# - Warns if the query hits the row limit (possible truncation)
 # ==========================================================
 
 from __future__ import annotations
@@ -49,11 +47,14 @@ MASTER_PATH = Path("master_results_clean.csv")  # required
 # -------------------------
 # BigQuery config (YOUR OWN MATERIALIZED X05 TABLE)
 # -------------------------
-BQ_PROJECT  = "lsst-484623"
-BQ_LOCATION = "US"
-BQ_DATASET  = "atlast_photometry"
-BQ_TABLE    = "public_obs_x05"
-BQ_ROW_LIMIT = 20000
+BQ_PROJECT   = "lsst-484623"
+BQ_LOCATION  = "US"
+BQ_DATASET   = "atlast_photometry"
+BQ_TABLE     = "public_obs_x05"
+
+# Default safety limits (user-adjustable in sidebar)
+BQ_DEFAULT_ROW_LIMIT = 20000
+BQ_MAX_ROW_LIMIT     = 200000  # hard cap for UI slider
 
 # BigQuery on-demand analysis pricing ballpark:
 BQ_USD_PER_TB = 5.0  # USD / TB (10^12 bytes)
@@ -83,7 +84,7 @@ def est_usd_cost(bytes_processed):
 
 
 # -------------------------
-# BigQuery (Streamlit Cloud safe) — no decorator caching
+# BigQuery client
 # -------------------------
 def get_bq_client():
     if "_bq_client" in st.session_state:
@@ -101,7 +102,7 @@ def get_bq_client():
     creds = service_account.Credentials.from_service_account_info(sa)
     client = bigquery.Client(project=BQ_PROJECT, credentials=creds)
 
-    # Smoke-test: can this SA create jobs at all?
+    # Smoke-test: can this SA create jobs?
     try:
         _ = client.query("SELECT 1", location=BQ_LOCATION).result()
     except Exception as e:
@@ -126,11 +127,141 @@ def _bq_job_debug_dict(job):
     }
 
 
-def bq_load_photometry_for_provid(provid):
+# -------------------------
+# Band normalization
+# -------------------------
+LSST_CANON = {"u", "g", "r", "i", "z", "y"}
+
+def normalize_lsst_band(x):
+    if x is None:
+        return ""
+    s = str(x).strip().lower()
+
+    if len(s) == 2 and s[0] == "l" and s[1] in LSST_CANON:
+        return s[1]
+
+    m = re.match(r"^(?:lsst)?([ugrizy])$", s)
+    if m:
+        return m.group(1)
+
+    return s
+
+
+# -------------------------
+# Load master
+# -------------------------
+def load_master(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path)
+
+
+def safe_num(s):
+    return pd.to_numeric(s, errors="coerce")
+
+
+def format_float(x, nd=6):
+    try:
+        v = float(x)
+        if np.isfinite(v):
+            return f"{v:.{nd}f}"
+    except Exception:
+        pass
+    return "—"
+
+
+def reliability_short(rel):
+    r = (rel or "").strip().lower()
+    return r if r in {"reliable", "ambiguous", "insufficient"} else "unknown"
+
+
+def reliability_html(rel):
+    r = reliability_short(rel)
+    if r == "reliable":
+        return '<span style="color:#22c55e;font-weight:800;">Reliable</span>'
+    if r == "ambiguous":
+        return '<span style="color:#f59e0b;font-weight:800;">Ambiguous</span>'
+    if r == "insufficient":
+        return '<span style="color:#ef4444;font-weight:800;">Insufficient</span>'
+    return '<span style="color:#64748b;font-weight:800;">Unknown</span>'
+
+
+def resolve_nights(df: pd.DataFrame):
+    for c in ["night", "night_id", "night_utc"]:
+        if c in df.columns:
+            s = df[c].astype(str)
+            if s.notna().sum() >= 3:
+                return int(s.nunique())
+    if "obstime_dt" in df.columns:
+        dt = pd.to_datetime(df["obstime_dt"], errors="coerce", utc=True)
+        if dt.notna().sum() >= 3:
+            return int(dt.dt.date.nunique())
+    return None
+
+
+def plot_fold(ax, t_hr, mag, bands, P_hr, title, mag_label, two_cycles=False):
+    phase = (t_hr / float(P_hr)) % 1.0
+    uniq = sorted(np.unique(bands).tolist())
+    for b in uniq:
+        m = (bands == b)
+        ax.scatter(phase[m], mag[m], s=10, label=str(b))
+        if two_cycles:
+            ax.scatter(phase[m] + 1.0, mag[m], s=10)
+    ax.invert_yaxis()
+    ax.set_xlabel("Phase (0–1)" if not two_cycles else "Phase (0–2)")
+    ax.set_ylabel(mag_label)
+    ax.set_title(title)
+    ax.set_xlim(0.0, 2.0 if two_cycles else 1.0)
+
+
+def make_df1_from_bq(df_raw: pd.DataFrame) -> pd.DataFrame:
+    df = df_raw.copy()
+    df["obstime_dt"] = pd.to_datetime(df["obstime"], errors="coerce", utc=True)
+    df["mag"] = pd.to_numeric(df["mag"], errors="coerce")
+    df["rmsmag"] = pd.to_numeric(df.get("rmsmag", np.nan), errors="coerce")
+    df["band"] = df.get("band", "x").map(normalize_lsst_band)
+
+    df = df.dropna(subset=["obstime_dt", "mag", "band"]).reset_index(drop=True)
+    if len(df) == 0:
+        return df
+
+    df = df.sort_values("obstime_dt")  # deterministic
+
+    t0 = df["obstime_dt"].min()
+    df["t_hr"] = (df["obstime_dt"] - t0).dt.total_seconds() / 3600.0
+    df["t_day"] = (df["obstime_dt"] - t0).dt.total_seconds() / 86400.0
+    df["night_utc"] = df["obstime_dt"].dt.strftime("%Y-%m-%d")
+    return df
+
+
+# -------------------------
+# BigQuery photometry fetch (with partition pruning)
+# -------------------------
+def _choose_window_days(arc_days_value, buffer_days: int, min_days: int, max_days: int) -> int:
+    """
+    Pick a time window in days to prune partitions.
+    If arc_days exists, use arc + buffer.
+    Else fall back to a safe default.
+    """
+    if arc_days_value is not None and np.isfinite(float(arc_days_value)) and float(arc_days_value) > 0:
+        w = int(np.ceil(float(arc_days_value) + float(buffer_days)))
+    else:
+        w = 400  # fallback
+    w = max(int(min_days), min(int(max_days), int(w)))
+    return int(w)
+
+
+def bq_load_photometry_for_provid(
+    provid: str,
+    *,
+    window_days: int,
+    row_limit: int,
+):
     client = get_bq_client()
     source_table = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
 
-    # NOTE: No ORDER BY (cheaper). We sort in pandas after fetching.
+    row_limit = int(max(1, min(int(row_limit), int(BQ_MAX_ROW_LIMIT))))
+
+    # Partition-pruning filter on obstime (your table is partitioned by obstime)
+    # ORDER BY obstime is now fine because scan is bounded by window_days.
     query = f"""
     SELECT
       provid,
@@ -141,17 +272,22 @@ def bq_load_photometry_for_provid(provid):
     FROM `{source_table}`
     WHERE provid = @prov
       AND mag IS NOT NULL
-    LIMIT {int(BQ_ROW_LIMIT)}
+      AND obstime >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @win DAY)
+    ORDER BY obstime
+    LIMIT {row_limit}
     """
 
     params = [
         bigquery.ScalarQueryParameter("prov", "STRING", provid),
+        bigquery.ScalarQueryParameter("win", "INT64", int(window_days)),
     ]
 
     bq_meta = {
         "provid": provid,
         "source_table": source_table,
         "location": BQ_LOCATION,
+        "window_days": int(window_days),
+        "row_limit": int(row_limit),
     }
 
     # ---- DRY RUN FIRST ----
@@ -207,27 +343,11 @@ def bq_load_photometry_for_provid(provid):
         "job_id": getattr(job, "job_id", None),
     })
 
+    # Truncation warning
+    bq_meta["returned_rows"] = int(len(df))
+    bq_meta["may_be_truncated"] = bool(len(df) >= row_limit)
+
     return df, bq_meta
-
-
-# -------------------------
-# Band normalization
-# -------------------------
-LSST_CANON = {"u", "g", "r", "i", "z", "y"}
-
-def normalize_lsst_band(x):
-    if x is None:
-        return ""
-    s = str(x).strip().lower()
-
-    if len(s) == 2 and s[0] == "l" and s[1] in LSST_CANON:
-        return s[1]
-
-    m = re.match(r"^(?:lsst)?([ugrizy])$", s)
-    if m:
-        return m.group(1)
-
-    return s
 
 
 # ======================================================================
@@ -240,9 +360,9 @@ def step5_geometry_horizons_range(
     OUTDIR,
     HORIZONS_LOCATION="X05",
     G_DEFAULT=0.15,
-    STEP_MINUTES=1,
-    PAD_MINUTES=5,
-    FAIL_ON_UNMATCHED=True,
+    STEP_MINUTES=10,
+    PAD_MINUTES=10,
+    FAIL_ON_UNMATCHED=False,
     TOL_DAYS=None,
     show_plots=False,
     save_plots=False,
@@ -282,7 +402,7 @@ def step5_geometry_horizons_range(
     t_utc = Time(dfG["obstime_dt"].dt.to_pydatetime(), scale="utc")
     dfG["jd_utc_obs"] = t_utc.jd.astype(float)
 
-    def query_horizons_range_smallbody(desig, start_utc, stop_utc, step_minutes=1, location="X05"):
+    def query_horizons_range_smallbody(desig, start_utc, stop_utc, step_minutes=10, location="X05"):
         obj = Horizons(
             id=desig,
             id_type="smallbody",
@@ -387,7 +507,7 @@ def step5_geometry_horizons_range(
         "STEP_MINUTES": int(STEP_MINUTES),
         "PAD_MINUTES": int(PAD_MINUTES),
         "TOL_DAYS": float(TOL_DAYS),
-        "night_key": str(night_key),
+        "night_key": str("night_id" if "night_id" in dfG.columns else "night_utc"),
         "n_blocks": int(len(blocks)),
         "n_obs": int(n_total),
         "n_matched": int(matched),
@@ -397,104 +517,15 @@ def step5_geometry_horizons_range(
     return dfM, step5_meta
 
 
-# -------------------------
-# More helpers
-# -------------------------
-def load_master(path):
-    return pd.read_csv(path)
-
-def safe_num(s):
-    return pd.to_numeric(s, errors="coerce")
-
-def format_float(x, nd=6):
-    try:
-        v = float(x)
-        if np.isfinite(v):
-            return f"{v:.{nd}f}"
-    except Exception:
-        pass
-    return "—"
-
-def reliability_short(rel):
-    r = (rel or "").strip().lower()
-    return r if r in {"reliable", "ambiguous", "insufficient"} else "unknown"
-
-def reliability_html(rel):
-    r = reliability_short(rel)
-    if r == "reliable":
-        return '<span style="color:#22c55e;font-weight:800;">Reliable</span>'
-    if r == "ambiguous":
-        return '<span style="color:#f59e0b;font-weight:800;">Ambiguous</span>'
-    if r == "insufficient":
-        return '<span style="color:#ef4444;font-weight:800;">Insufficient</span>'
-    return '<span style="color:#64748b;font-weight:800;">Unknown</span>'
-
-def norm_id(x):
-    if x is None:
-        return ""
-    s = str(x).strip().lower()
-    for ch in [" ", "_", "-", "\t", "\n", "\r"]:
-        s = s.replace(ch, "")
-    return s
-
-def resolve_nights(df):
-    for c in ["night", "night_id", "night_utc"]:
-        if c in df.columns:
-            s = df[c].astype(str)
-            if s.notna().sum() >= 3:
-                return int(s.nunique())
-    if "obstime_dt" in df.columns:
-        dt = pd.to_datetime(df["obstime_dt"], errors="coerce", utc=True)
-        if dt.notna().sum() >= 3:
-            return int(dt.dt.date.nunique())
-    return None
-
-def plot_fold(ax, t_hr, mag, bands, P_hr, title, mag_label, two_cycles=False):
-    phase = (t_hr / float(P_hr)) % 1.0
-    uniq = sorted(np.unique(bands).tolist())
-    for b in uniq:
-        m = (bands == b)
-        ax.scatter(phase[m], mag[m], s=10, label=str(b))
-        if two_cycles:
-            ax.scatter(phase[m] + 1.0, mag[m], s=10)
-    ax.invert_yaxis()
-    ax.set_xlabel("Phase (0–1)" if not two_cycles else "Phase (0–2)")
-    ax.set_ylabel(mag_label)
-    ax.set_title(title)
-    ax.set_xlim(0.0, 2.0 if two_cycles else 1.0)
-
-def make_df1_from_bq(df_raw):
-    df = df_raw.copy()
-    df["obstime_dt"] = pd.to_datetime(df["obstime"], errors="coerce", utc=True)
-    df["mag"] = pd.to_numeric(df["mag"], errors="coerce")
-    df["rmsmag"] = pd.to_numeric(df.get("rmsmag", np.nan), errors="coerce")
-    df["band"] = df.get("band", "x").map(normalize_lsst_band)
-
-    df = df.dropna(subset=["obstime_dt", "mag", "band"]).reset_index(drop=True)
-
-    # Sort in pandas (since BigQuery query has no ORDER BY)
-    if "obstime_dt" in df.columns:
-        df = df.sort_values("obstime_dt")
-
-    if len(df) == 0:
-        return df
-
-    t0 = df["obstime_dt"].min()
-    df["t_hr"] = (df["obstime_dt"] - t0).dt.total_seconds() / 3600.0
-    df["t_day"] = (df["obstime_dt"] - t0).dt.total_seconds() / 86400.0
-    df["night_utc"] = df["obstime_dt"].dt.strftime("%Y-%m-%d")
-    return df
-
-
-def geo_correct_cached(df1, provid):
+def geo_correct(df1, provid):
     df_geo, meta = step5_geometry_horizons_range(
         df1,
         PROVID=provid,
         OUTDIR=".",
         HORIZONS_LOCATION=HORIZONS_LOCATION,
         G_DEFAULT=HG_G_DEFAULT,
-        STEP_MINUTES=10,   # DEMO
-        PAD_MINUTES=10,    # DEMO
+        STEP_MINUTES=10,
+        PAD_MINUTES=10,
         FAIL_ON_UNMATCHED=False,
         save_tables=False,
         save_plots=False,
@@ -505,8 +536,10 @@ def geo_correct_cached(df1, provid):
 
 
 # -------------------------
-# Load master
+# Start app
 # -------------------------
+st.markdown("## ATLAST Asteroid Rotation Dashboard")
+
 if not MASTER_PATH.exists():
     st.error(f"Missing required file: {MASTER_PATH}")
     st.stop()
@@ -520,7 +553,7 @@ if "Designation" not in master.columns:
             master = master.rename(columns={c: "Designation"})
             break
 
-# Convert numeric columns if present (optional)
+# Convert numeric columns if present
 NUM_COLS = [
     "H Mag", "Mean Mag (r Band)", "Number of Observations", "Arc (days)",
     "LS peak period (hr)", "Adopted period (hr)", "Adopted K",
@@ -532,22 +565,26 @@ for c in NUM_COLS:
     if c in master.columns:
         master[c] = safe_num(master[c])
 
-# Reliable count label
-if "Reliability" in master.columns:
-    _rel_short_all = master["Reliability"].astype(str).map(reliability_short)
-    RELIABLE_COUNT = int((_rel_short_all == "reliable").sum())
-else:
-    RELIABLE_COUNT = 0
+RELIABLE_COUNT = int((master.get("Reliability", "").astype(str).str.lower() == "reliable").sum()) if "Reliability" in master.columns else 0
 
-
-# -------------------------
-# Sidebar + layout
-# -------------------------
+# Sidebar
 st.sidebar.markdown("## Mode")
 mode = st.sidebar.radio("View", ["Asteroid Viewer", "Population Explorer"], index=0)
 
-st.markdown("## ATLAST Asteroid Rotation Dashboard")
+st.sidebar.markdown("---")
+st.sidebar.markdown("## BigQuery Controls")
 
+row_limit = st.sidebar.slider(
+    "Max rows per asteroid query",
+    min_value=1000,
+    max_value=BQ_MAX_ROW_LIMIT,
+    value=BQ_DEFAULT_ROW_LIMIT,
+    step=1000,
+)
+
+buffer_days = st.sidebar.slider("Window buffer (days)", 0, 120, 30, 5)
+min_window = st.sidebar.slider("Min window (days)", 30, 400, 60, 10)
+max_window = st.sidebar.slider("Max window (days)", 100, 2000, 800, 50)
 
 # ==========================================================
 # MODE 1: ASTEROID VIEWER
@@ -564,7 +601,6 @@ if mode == "Asteroid Viewer":
     q = st.sidebar.text_input("Search Designation", value="", placeholder="E.g., 2025 ME69")
 
     df_pick = master.copy()
-
     if q.strip():
         df_pick = df_pick[df_pick["Designation"].astype(str).str.contains(q.strip(), case=False, na=False)]
 
@@ -583,21 +619,8 @@ if mode == "Asteroid Viewer":
         )
         st.stop()
 
-    selected = st.sidebar.selectbox(
-        "Selected Asteroid",
-        options=designations,
-        index=0,
-        key="selected_asteroid",
-    )
-
-    st.sidebar.checkbox(
-        f"Reliable Periods only ({RELIABLE_COUNT:,})",
-        key="reliable_only",
-    )
-
-    if bool(st.session_state.get("reliable_only", False)) and (selected not in designations):
-        st.session_state.selected_asteroid = designations[0]
-        st.rerun()
+    selected = st.sidebar.selectbox("Selected Asteroid", options=designations, index=0, key="selected_asteroid")
+    st.sidebar.checkbox(f"Reliable Periods only ({RELIABLE_COUNT:,})", key="reliable_only")
 
     row = master[master["Designation"].astype(str) == str(selected)]
     row = row.iloc[0].to_dict() if len(row) else {}
@@ -606,6 +629,9 @@ if mode == "Asteroid Viewer":
     P_adopt = float(row.get("Adopted period (hr)", np.nan))
     if not (np.isfinite(P_adopt) and P_adopt > 0):
         P_adopt = 5.0
+
+    arc_days = row.get("Arc (days)", np.nan)
+    window_days = _choose_window_days(arc_days, buffer_days=buffer_days, min_days=min_window, max_days=max_window)
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("## Fold Controls")
@@ -631,12 +657,7 @@ if mode == "Asteroid Viewer":
         st.rerun()
 
     LSST_BANDS = ["u", "g", "r", "i", "z", "y"]
-    sel_bands_sidebar = st.sidebar.multiselect(
-        "Bands",
-        options=LSST_BANDS,
-        default=["g", "r", "i"],
-    )
-
+    sel_bands_sidebar = st.sidebar.multiselect("Bands", options=LSST_BANDS, default=["g", "r", "i"])
     two_cycles = st.sidebar.checkbox("Show two cycles (0–2)", value=False)
 
     tab_photo, tab_char = st.tabs(["Photometry", "Characterisation"])
@@ -647,18 +668,20 @@ if mode == "Asteroid Viewer":
             unsafe_allow_html=True,
         )
 
-        n_obs_master = row.get("Number of Observations", np.nan)
-        arc_days = row.get("Arc (days)", np.nan)
-
-        with st.spinner("Querying BigQuery photometry (minimal columns) ..."):
-            df_raw, bq_meta = bq_load_photometry_for_provid(str(selected))
+        with st.spinner(f"Querying BigQuery photometry (window_days={window_days}, limit={row_limit}) ..."):
+            df_raw, bq_meta = bq_load_photometry_for_provid(str(selected), window_days=window_days, row_limit=row_limit)
 
         with st.expander("BigQuery Cost & Query Diagnostics", expanded=False):
-            st.write("If bytes are huge (GB–TB), the query is scanning too much.")
             st.json(bq_meta)
 
+        if bq_meta.get("may_be_truncated", False):
+            st.warning(
+                f"Returned {bq_meta.get('returned_rows')} rows and hit the row limit ({row_limit}). "
+                "Increase the row limit or increase the time window if you expect more data."
+            )
+
         if df_raw is None or len(df_raw) == 0:
-            st.info("No photometry rows found in BigQuery for this asteroid (provid match).")
+            st.info("No photometry rows found in BigQuery for this asteroid under the current time window.")
             st.stop()
 
         df1 = make_df1_from_bq(df_raw)
@@ -669,7 +692,7 @@ if mode == "Asteroid Viewer":
 
         with st.spinner("Running geometry correction (Horizons) ..."):
             try:
-                df_geo, meta5 = geo_correct_cached(df1, str(selected))
+                df_geo, meta5 = geo_correct(df1, str(selected))
             except Exception as e:
                 st.error("Geometry correction failed (Horizons). Showing raw mags instead.")
                 st.exception(e)
@@ -702,20 +725,13 @@ if mode == "Asteroid Viewer":
         s1, s2, s3, s4 = st.columns(4)
         s1.metric("Adopted Rotation Period (hours)", format_float(row.get("Adopted period (hr)", np.nan), 6))
         s2.metric("Fold Period (hours)", format_float(P_calc, 6))
-        s3.metric("Observations (number)", "—" if pd.isna(n_obs_master) else str(int(n_obs_master)))
+        s3.metric("Observations (returned)", f"{len(dfp):,}")
         s4.metric("Nights (photometry)", "—" if n_nights is None else str(int(n_nights)))
 
-        if np.isfinite(float(arc_days)):
-            st.caption(f"Arc Length (days): {format_float(arc_days, 3)}")
-
-        st.caption(f"Folding uses: **{mag_label}**")
-
-        if len(dfp) < 5:
-            st.warning("Very few points remain after band filtering. Try selecting more bands.")
-            st.stop()
+        st.caption(f"Folding uses: **{mag_label}**  |  Query window_days={window_days}")
 
         t_hr = dfp["t_hr"].to_numpy(float)
-        t_day = dfp["t_day"].to_numpy(float) if "t_day" in dfp.columns else (t_hr / 24.0)
+        t_day = dfp["t_day"].to_numpy(float)
         mag = pd.to_numeric(dfp[mag_col], errors="coerce").to_numpy(float)
         bands = dfp["band"].to_numpy(str)
 
@@ -730,16 +746,7 @@ if mode == "Asteroid Viewer":
         for col, P_hr, title in zip(cols, periods, titles):
             with col:
                 fig, ax = plt.subplots(figsize=(5.2, 3.6))
-                plot_fold(
-                    ax,
-                    t_hr=t_hr,
-                    mag=mag,
-                    bands=bands,
-                    P_hr=P_hr,
-                    title=title,
-                    mag_label=mag_label,
-                    two_cycles=two_cycles,
-                )
+                plot_fold(ax, t_hr=t_hr, mag=mag, bands=bands, P_hr=P_hr, title=title, mag_label=mag_label, two_cycles=two_cycles)
                 ax.legend(fontsize=7)
                 st.pyplot(fig, clear_figure=True)
 
