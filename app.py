@@ -323,15 +323,10 @@ def get_bq_client():
     return client
 
 
-def _choose_window_days(arc_val, buffer_days, min_days, max_days):
-    if arc_val is not None and np.isfinite(float(arc_val)) and float(arc_val) > 0:
-        w = int(np.ceil(float(arc_val) + float(buffer_days)))
-    else:
-        w = 400
-    return int(max(min_days, min(max_days, w)))
-
-
-def bq_load_photometry_for_provid(provid, *, window_days, row_limit):
+def bq_load_photometry_for_provid(provid, *, row_limit):
+    """Fetch all available photometry for provid — no time-window filter.
+    The 2025 cohort data is ~1 year old; a rolling window from NOW would
+    miss it entirely. We rely on provid equality for scan efficiency."""
     client = get_bq_client()
     source = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
     row_limit = int(max(1, min(row_limit, BQ_MAX_ROW_LIMIT)))
@@ -343,21 +338,17 @@ def bq_load_photometry_for_provid(provid, *, window_days, row_limit):
     FROM `{source}`
     WHERE provid = @prov
       AND mag IS NOT NULL
-      AND obstime >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @win DAY)
     ORDER BY obstime
     LIMIT {row_limit}
     """
-    params = [
-        bigquery.ScalarQueryParameter("prov", "STRING", provid),
-        bigquery.ScalarQueryParameter("win",  "INT64",  window_days),
-    ]
-    bq_meta = {"provid": provid, "source_table": source,
-                "window_days": window_days, "row_limit": row_limit}
+    params = [bigquery.ScalarQueryParameter("prov", "STRING", provid)]
+    bq_meta = {"provid": provid, "source_table": source, "row_limit": row_limit}
 
     try:
         dry = client.query(query, location=BQ_LOCATION,
                            job_config=bigquery.QueryJobConfig(
-                               query_parameters=params, dry_run=True, use_query_cache=False))
+                               query_parameters=params, dry_run=True,
+                               use_query_cache=False))
         est = int(getattr(dry, "total_bytes_processed", 0) or 0)
         bq_meta.update({"dry_run_ok": True,
                          "estimated_bytes_human": bytes_to_human(est),
@@ -388,15 +379,10 @@ def bq_load_photometry_for_provid(provid, *, window_days, row_limit):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def bq_fetch_cached(provid: str, window_days: int, row_limit: int):
-    """
-    Cached BQ fetch — same (provid, window_days, row_limit) within 1 hour
-    costs zero BQ bytes. Streamlit serves from in-process memory.
-    This is the primary cost-reduction mechanism for public viewers.
-    """
-    return bq_load_photometry_for_provid(provid,
-                                          window_days=window_days,
-                                          row_limit=row_limit)
+def bq_fetch_cached(provid: str, row_limit: int):
+    """Process-level cache (1-hour TTL). Multiple viewers of the same
+    asteroid within 1 hour pay zero BQ bytes after the first load."""
+    return bq_load_photometry_for_provid(provid, row_limit=row_limit)
 
 
 def make_df1_from_bq(df_raw):
@@ -606,7 +592,6 @@ if mode == "Asteroid Viewer":
     if not (np.isfinite(P_adopt) and P_adopt > 0):
         P_adopt = 5.0
 
-    arc_val = row.get(C_ARC, np.nan)
 
     # ---- Fold Controls ----
     st.sidebar.markdown("---")
@@ -617,7 +602,7 @@ if mode == "Asteroid Viewer":
         old = st.session_state.get("fold_period_for")
         if old:
             for k in list(st.session_state.keys()):
-                if k.startswith(f"_phot_{old}_"):
+                if k.startswith(f"_phot_{old}"):
                     del st.session_state[k]
         st.session_state["fold_period_for"]     = selected
         st.session_state["_reset_to_adopted"]   = True   # triggers pre-slider reset below
@@ -673,41 +658,25 @@ if mode == "Asteroid Viewer":
     sel_bands_sidebar = st.sidebar.multiselect("Bands", LSST_BANDS, default=["g", "r", "i"])
     two_cycles = st.sidebar.checkbox("Show two cycles (0–2)", value=False)
 
-    # BigQuery parameters — hardcoded sensible defaults, not exposed in UI
-    row_limit   = BQ_DEFAULT_ROW_LIMIT
-    buffer_days = 30
-    min_window  = 60
-    max_window  = 800
-    window_days = _choose_window_days(arc_val, buffer_days, min_window, max_window)
+    row_limit = BQ_DEFAULT_ROW_LIMIT
 
     # ---- Main tabs ----
     tab_photo, tab_char = st.tabs(["Photometry", "Characterisation"])
 
     # ------------------------------------------------------------------
-    # Fetch photometry + geometry correction once per asteroid/window.
-    # Results are stored in session_state so that changing the fold
-    # period (buttons, slider) never triggers a re-query.
-    # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    # Fetch photometry — two-layer cache:
-    #   Layer 1: @st.cache_data (process-level, 1-hour TTL)
-    #            Multiple users viewing the same asteroid within 1 hour
+    # Two-layer cache:
+    #   Layer 1: @st.cache_data (1-hour TTL, process-level)
+    #            Multiple viewers of the same asteroid within 1 hour
     #            pay zero BQ bytes after the first load.
     #   Layer 2: st.session_state (per-session)
-    #            Fold period changes and button clicks never re-query.
-    #
-    # Cost note: with the partition-pruning WHERE clause, each query
-    # typically scans 5–40 MB per asteroid (~$0.00025 max at $5/TB).
-    # The @st.cache_data layer means the real cost per asteroid is
-    # incurred at most once per hour across all viewers.
+    #            Slider/band changes never re-query BQ or Horizons.
     # ------------------------------------------------------------------
-    cache_key = f"_phot_{selected}_{window_days}_{row_limit}"
+    cache_key = f"_phot_{selected}"
 
     if cache_key not in st.session_state:
         with st.spinner(f"Loading photometry for {selected} ..."):
             try:
-                df_raw, bq_meta = bq_fetch_cached(
-                    str(selected), window_days, row_limit)
+                df_raw, bq_meta = bq_fetch_cached(str(selected), row_limit)
             except Exception:
                 df_raw, bq_meta = None, {}
 
@@ -797,7 +766,7 @@ if mode == "Asteroid Viewer":
         s3.metric("Observations returned", f"{len(dfp):,}")
         s4.metric("Nights",               "—" if n_nights is None else str(n_nights))
 
-        st.caption(f"Folding: **{mag_label}** · window_days={window_days}")
+        st.caption(f"Folding: **{mag_label}** · all available data")
 
         # ---- Alternative period candidates (read-only info panel) ----
         alt_candidates = [c for c in candidates if not c.get("is_adopted")]
