@@ -294,14 +294,17 @@ def render_period_candidate_ladder(
         with c1:
             if st.button(_lbl(half_p), key=f"btn_{cand['label']}_half", use_container_width=True):
                 st.session_state[state_key] = half_p
+                st.session_state["fold_period_slider"] = half_p
                 st.rerun()
         with c2:
             if st.button(_lbl(P_c), key=f"btn_{cand['label']}_P", use_container_width=True):
                 st.session_state[state_key] = P_c
+                st.session_state["fold_period_slider"] = P_c
                 st.rerun()
         with c3:
             if st.button(_lbl(two_p), key=f"btn_{cand['label']}_two", use_container_width=True):
                 st.session_state[state_key] = two_p
+                st.session_state["fold_period_slider"] = two_p
                 st.rerun()
 
         st.sidebar.caption(f"P/2={half_p:.4f}  ·  P={P_c:.4f}  ·  2P={two_p:.4f}")
@@ -653,8 +656,15 @@ if mode == "Asteroid Viewer":
     st.sidebar.markdown("## Fold Controls")
 
     if st.session_state.get("fold_period_for") != selected:
-        st.session_state["fold_period"]     = float(P_adopt)
-        st.session_state["fold_period_for"] = selected
+        # Clear cached photometry for the previous asteroid
+        old = st.session_state.get("fold_period_for")
+        if old:
+            for k in list(st.session_state.keys()):
+                if k.startswith(f"_phot_{old}_"):
+                    del st.session_state[k]
+        st.session_state["fold_period"]        = float(P_adopt)
+        st.session_state["fold_period_slider"] = float(P_adopt)
+        st.session_state["fold_period_for"]    = selected
 
     candidates = build_period_candidates(row)
 
@@ -678,6 +688,7 @@ if mode == "Asteroid Viewer":
 
     if st.sidebar.button("↩ Reset To Adopted Period", use_container_width=True):
         st.session_state["fold_period"] = float(P_adopt)
+        st.session_state["fold_period_slider"] = float(P_adopt)
         st.rerun()
 
     st.sidebar.markdown("---")
@@ -703,6 +714,44 @@ if mode == "Asteroid Viewer":
 
     # ---- Main tabs ----
     tab_photo, tab_char = st.tabs(["Photometry", "Characterisation"])
+
+    # ------------------------------------------------------------------
+    # Fetch photometry + geometry correction once per asteroid/window.
+    # Results are stored in session_state so that changing the fold
+    # period (buttons, slider) never triggers a re-query.
+    # ------------------------------------------------------------------
+    cache_key = f"_phot_{selected}_{window_days}_{row_limit}"
+
+    if cache_key not in st.session_state:
+        with st.spinner(f"Querying BigQuery (window={window_days}d, limit={row_limit}) ..."):
+            try:
+                df_raw, bq_meta = bq_load_photometry_for_provid(
+                    str(selected), window_days=window_days, row_limit=row_limit)
+            except Exception:
+                df_raw, bq_meta = None, {}
+
+        if df_raw is not None and len(df_raw) >= 5:
+            df1 = make_df1_from_bq(df_raw)
+            with st.spinner("Running geometry correction (Horizons) ..."):
+                try:
+                    df_geo, meta5 = geo_correct(df1, str(selected))
+                except Exception as e:
+                    df_geo = df1.copy()
+                    df_geo["mag_geo"] = df_geo["mag_geo_bandcenter"] = np.nan
+                    meta5 = {"error": str(e)}
+        else:
+            df_geo, meta5 = None, {}
+
+        st.session_state[cache_key] = {
+            "bq_meta": bq_meta,
+            "df_geo":  df_geo,
+            "meta5":   meta5,
+        }
+
+    cached     = st.session_state[cache_key]
+    bq_meta    = cached["bq_meta"]
+    df_geo     = cached["df_geo"]
+    meta5      = cached["meta5"]
 
     with tab_photo:
         # Header with reliability badge + 2P flag + human review warning
@@ -730,10 +779,6 @@ if mode == "Asteroid Viewer":
         if prefer_2p and row.get(C_PREFER_2P_R):
             st.info(f"Pipeline 2P preference: *{row[C_PREFER_2P_R]}*")
 
-        with st.spinner(f"Querying BigQuery (window={window_days}d, limit={row_limit}) ..."):
-            df_raw, bq_meta = bq_load_photometry_for_provid(
-                str(selected), window_days=window_days, row_limit=row_limit)
-
         with st.expander("BigQuery Cost & Query Diagnostics", expanded=False):
             st.json(bq_meta)
 
@@ -741,25 +786,9 @@ if mode == "Asteroid Viewer":
             st.warning(f"Returned {bq_meta['returned_rows']} rows — hit row limit. "
                        "Increase the slider in BigQuery Controls if needed.")
 
-        if df_raw is None or len(df_raw) == 0:
+        if df_geo is None or len(df_geo) == 0:
             st.info("No photometry found in BigQuery for this asteroid under the current time window.")
             st.stop()
-
-        df1 = make_df1_from_bq(df_raw)
-        if len(df1) < 5:
-            st.warning("Very few usable points after cleaning.")
-            st.dataframe(df1.head(50), use_container_width=True)
-            st.stop()
-
-        with st.spinner("Running geometry correction (Horizons) ..."):
-            try:
-                df_geo, meta5 = geo_correct(df1, str(selected))
-            except Exception as e:
-                st.error("Geometry correction failed — using raw mags.")
-                st.exception(e)
-                df_geo = df1.copy()
-                df_geo["mag_geo"] = df_geo["mag_geo_bandcenter"] = np.nan
-                meta5 = {}
 
         if df_geo["mag_geo_bandcenter"].notna().sum() >= 5:
             mag_col, mag_label = "mag_geo_bandcenter", "mag_geo_bandcenter (corrected, band-centred)"
