@@ -606,25 +606,25 @@ if mode == "Asteroid Viewer":
     if not (np.isfinite(P_adopt) and P_adopt > 0):
         P_adopt = 5.0
 
-    arc_val     = row.get(C_ARC, np.nan)
+    arc_val = row.get(C_ARC, np.nan)
 
     # ---- Fold Controls ----
     st.sidebar.markdown("---")
     st.sidebar.markdown("## Fold Controls")
 
+    # Handle asteroid switch: reset period and clear photometry cache
     if st.session_state.get("fold_period_for") != selected:
         old = st.session_state.get("fold_period_for")
         if old:
             for k in list(st.session_state.keys()):
                 if k.startswith(f"_phot_{old}_"):
                     del st.session_state[k]
-        st.session_state["fold_period"]        = float(P_adopt)
-        st.session_state["fold_period_slider"] = float(P_adopt)
-        st.session_state["fold_period_for"]    = selected
+        st.session_state["fold_period_for"]     = selected
+        st.session_state["_reset_to_adopted"]   = True   # triggers pre-slider reset below
 
     candidates = build_period_candidates(row)
 
-    # Slider range covers adopted P, all alt candidates and their harmonics
+    # Slider range covers adopted P and all candidate harmonics
     all_bounds = [P_adopt]
     for cand in candidates:
         p = cand["period"]
@@ -633,39 +633,51 @@ if mode == "Asteroid Viewer":
     hi   = max(all_bounds) * 1.1
     step = float((hi - lo) / 600.0) if hi > lo else 1e-6
 
-    # Pre-set key before rendering to avoid Streamlit double-set warning
-    current_p = float(st.session_state.get("fold_period", P_adopt))
-    clamped   = float(np.clip(current_p, lo, hi))
-    clamped   = round(round((clamped - lo) / step) * step + lo, 8)
-    clamped   = float(np.clip(clamped, lo, hi))
-    st.session_state["fold_period_slider"] = clamped
-    st.session_state["fold_period"]        = clamped
+    # ------------------------------------------------------------------
+    # CRITICAL: apply any pending reset BEFORE the slider renders.
+    # Writing to a widget key after the widget is drawn raises
+    # StreamlitAPIException. We use a flag instead of writing directly
+    # in the button callback, so the write always happens pre-render.
+    # ------------------------------------------------------------------
+    if st.session_state.pop("_reset_to_adopted", False):
+        target = float(np.clip(P_adopt, lo, hi))
+        target = round(round((target - lo) / step) * step + lo, 8)
+        target = float(np.clip(target, lo, hi))
+        st.session_state["fold_period_slider"] = target
+        st.session_state["fold_period"]        = target
+    else:
+        # Clamp stored value into current bounds (bounds may have shifted)
+        current_p = float(st.session_state.get("fold_period", P_adopt))
+        clamped   = float(np.clip(current_p, lo, hi))
+        clamped   = round(round((clamped - lo) / step) * step + lo, 8)
+        clamped   = float(np.clip(clamped, lo, hi))
+        st.session_state["fold_period_slider"] = clamped
+        st.session_state["fold_period"]        = clamped
 
     P_calc = st.sidebar.slider(
         "Fold Period (hours)",
         min_value=float(lo),
         max_value=float(hi),
         step=step,
-        key="fold_period_slider",
+        key="fold_period_slider",   # NO value= here — reads from session_state key
     )
     st.session_state["fold_period"] = float(P_calc)
 
+    # Button sets the flag and reruns; the actual key write happens next run
+    # BEFORE the slider renders, so no StreamlitAPIException.
     if st.sidebar.button("↩ Reset To Adopted Period", use_container_width=True):
-        st.session_state["fold_period"]        = float(P_adopt)
-        st.session_state["fold_period_slider"] = float(P_adopt)
+        st.session_state["_reset_to_adopted"] = True
         st.rerun()
 
     LSST_BANDS = ["u", "g", "r", "i", "z", "y"]
     sel_bands_sidebar = st.sidebar.multiselect("Bands", LSST_BANDS, default=["g", "r", "i"])
     two_cycles = st.sidebar.checkbox("Show two cycles (0–2)", value=False)
 
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("## BigQuery Controls")
-    row_limit   = st.sidebar.slider("Max rows per query",   1000, BQ_MAX_ROW_LIMIT, BQ_DEFAULT_ROW_LIMIT, 1000)
-    buffer_days = st.sidebar.slider("Window buffer (days)", 0,    120,  30,  5)
-    min_window  = st.sidebar.slider("Min window (days)",    30,   400,  60, 10)
-    max_window  = st.sidebar.slider("Max window (days)",    100, 2000, 800, 50)
-
+    # BigQuery parameters — hardcoded sensible defaults, not exposed in UI
+    row_limit   = BQ_DEFAULT_ROW_LIMIT
+    buffer_days = 30
+    min_window  = 60
+    max_window  = 800
     window_days = _choose_window_days(arc_val, buffer_days, min_window, max_window)
 
     # ---- Main tabs ----
@@ -759,7 +771,7 @@ if mode == "Asteroid Viewer":
 
         if bq_meta.get("may_be_truncated"):
             st.warning(f"Returned {bq_meta['returned_rows']} rows — hit row limit. "
-                       "Increase the slider in BigQuery Controls if needed.")
+                       "Results may be truncated — the arc window has been capped.")
 
         if df_geo is None or len(df_geo) == 0:
             st.info("No photometry found in BigQuery for this asteroid under the current time window.")
@@ -919,12 +931,11 @@ else:
 
     prefer2p_filter = st.sidebar.checkbox("Pipeline-preferred 2P only", value=False)
 
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("## BigQuery Controls")
-    row_limit   = st.sidebar.slider("Max rows per query",   1000, BQ_MAX_ROW_LIMIT, BQ_DEFAULT_ROW_LIMIT, 1000)
-    buffer_days = st.sidebar.slider("Window buffer (days)", 0,    120,  30,  5)
-    min_window  = st.sidebar.slider("Min window (days)",    30,   400,  60, 10)
-    max_window  = st.sidebar.slider("Max window (days)",    100, 2000, 800, 50)
+    # BigQuery parameters — hardcoded, not exposed in UI
+    row_limit   = BQ_DEFAULT_ROW_LIMIT
+    buffer_days = 30
+    min_window  = 60
+    max_window  = 800
 
     df_f = master.copy()
     if C_RELIABILITY in df_f.columns:
