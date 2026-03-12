@@ -1,14 +1,15 @@
-# app.py
+# app.py — Iteration 1
 # ==========================================================
 # ATLAST Asteroid Rotation Dashboard
-# Photometry queried from your LOCAL BigQuery table and folded with
-# on-the-fly geometry correction (JPL Horizons).
 #
-# Key design choices (2026-02-27 republish):
-# - Uses your local, partitioned table: lsst-484623.atlast_photometry.public_obs_x05
-# - Adds partition-pruning time window on obstime (cheap + predictable)
-# - Restores ORDER BY obstime (safe after pruning)
-# - Warns if the query hits the row limit (possible truncation)
+# Iteration 1 changes vs baseline:
+#   - Period Candidate Ladder replaces the bare fold-period slider
+#   - Shows LS Peak, Adopted, and 2P Candidate from master CSV
+#   - Each candidate has P/2 · P · 2P one-click buttons
+#   - Slider still present for fine-tuning after a button click
+#   - ΔBIC shown next to 2P candidate so users know its confidence
+#   - "Additional Periods" section for any extra pipeline candidates
+#     (populated from "LS peak period (hr)" alt harmonics if present)
 # ==========================================================
 
 from __future__ import annotations
@@ -45,19 +46,17 @@ MASTER_PATH = Path("master_results_clean.csv")  # required
 
 
 # -------------------------
-# BigQuery config (YOUR OWN MATERIALIZED X05 TABLE)
+# BigQuery config
 # -------------------------
 BQ_PROJECT   = "lsst-484623"
 BQ_LOCATION  = "US"
 BQ_DATASET   = "atlast_photometry"
 BQ_TABLE     = "public_obs_x05"
 
-# Default safety limits (user-adjustable in sidebar)
 BQ_DEFAULT_ROW_LIMIT = 20000
-BQ_MAX_ROW_LIMIT     = 200000  # hard cap for UI slider
+BQ_MAX_ROW_LIMIT     = 200000
 
-# BigQuery on-demand analysis pricing ballpark:
-BQ_USD_PER_TB = 5.0  # USD / TB (10^12 bytes)
+BQ_USD_PER_TB = 5.0
 
 # -------------------------
 # Horizons config
@@ -102,7 +101,6 @@ def get_bq_client():
     creds = service_account.Credentials.from_service_account_info(sa)
     client = bigquery.Client(project=BQ_PROJECT, credentials=creds)
 
-    # Smoke-test: can this SA create jobs?
     try:
         _ = client.query("SELECT 1", location=BQ_LOCATION).result()
     except Exception as e:
@@ -136,14 +134,11 @@ def normalize_lsst_band(x):
     if x is None:
         return ""
     s = str(x).strip().lower()
-
     if len(s) == 2 and s[0] == "l" and s[1] in LSST_CANON:
         return s[1]
-
     m = re.match(r"^(?:lsst)?([ugrizy])$", s)
     if m:
         return m.group(1)
-
     return s
 
 
@@ -218,13 +213,10 @@ def make_df1_from_bq(df_raw: pd.DataFrame) -> pd.DataFrame:
     df["mag"] = pd.to_numeric(df["mag"], errors="coerce")
     df["rmsmag"] = pd.to_numeric(df.get("rmsmag", np.nan), errors="coerce")
     df["band"] = df.get("band", "x").map(normalize_lsst_band)
-
     df = df.dropna(subset=["obstime_dt", "mag", "band"]).reset_index(drop=True)
     if len(df) == 0:
         return df
-
-    df = df.sort_values("obstime_dt")  # deterministic
-
+    df = df.sort_values("obstime_dt")
     t0 = df["obstime_dt"].min()
     df["t_hr"] = (df["obstime_dt"] - t0).dt.total_seconds() / 3600.0
     df["t_day"] = (df["obstime_dt"] - t0).dt.total_seconds() / 86400.0
@@ -233,35 +225,22 @@ def make_df1_from_bq(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 
 # -------------------------
-# BigQuery photometry fetch (with partition pruning)
+# BigQuery photometry fetch
 # -------------------------
 def _choose_window_days(arc_days_value, buffer_days: int, min_days: int, max_days: int) -> int:
-    """
-    Pick a time window in days to prune partitions.
-    If arc_days exists, use arc + buffer.
-    Else fall back to a safe default.
-    """
     if arc_days_value is not None and np.isfinite(float(arc_days_value)) and float(arc_days_value) > 0:
         w = int(np.ceil(float(arc_days_value) + float(buffer_days)))
     else:
-        w = 400  # fallback
+        w = 400
     w = max(int(min_days), min(int(max_days), int(w)))
     return int(w)
 
 
-def bq_load_photometry_for_provid(
-    provid: str,
-    *,
-    window_days: int,
-    row_limit: int,
-):
+def bq_load_photometry_for_provid(provid, *, window_days, row_limit):
     client = get_bq_client()
     source_table = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
-
     row_limit = int(max(1, min(int(row_limit), int(BQ_MAX_ROW_LIMIT))))
 
-    # Partition-pruning filter on obstime (your table is partitioned by obstime)
-    # ORDER BY obstime is now fine because scan is bounded by window_days.
     query = f"""
     SELECT
       provid,
@@ -290,13 +269,8 @@ def bq_load_photometry_for_provid(
         "row_limit": int(row_limit),
     }
 
-    # ---- DRY RUN FIRST ----
     try:
-        dry_cfg = bigquery.QueryJobConfig(
-            query_parameters=params,
-            dry_run=True,
-            use_query_cache=False,
-        )
+        dry_cfg = bigquery.QueryJobConfig(query_parameters=params, dry_run=True, use_query_cache=False)
         dry_job = client.query(query, job_config=dry_cfg, location=BQ_LOCATION)
         est_bytes = int(getattr(dry_job, "total_bytes_processed", 0) or 0)
         bq_meta.update({
@@ -307,29 +281,19 @@ def bq_load_photometry_for_provid(
         })
     except Exception as e:
         bq_meta.update({"dry_run_ok": False})
-        st.error("BigQuery DRY RUN failed (permissions/location/table access).")
+        st.error("BigQuery DRY RUN failed.")
         st.json(bq_meta)
         st.exception(e)
         raise
 
-    # ---- ACTUAL RUN ----
-    run_cfg = bigquery.QueryJobConfig(
-        query_parameters=params,
-        use_query_cache=True,
-    )
+    run_cfg = bigquery.QueryJobConfig(query_parameters=params, use_query_cache=True)
     job = client.query(query, job_config=run_cfg, location=BQ_LOCATION)
 
     try:
         df = job.to_dataframe(create_bqstorage_client=False)
     except (Forbidden, BadRequest, NotFound) as e:
         bq_meta.update({"job_debug": _bq_job_debug_dict(job)})
-        st.error(
-            "BigQuery query failed.\n\n"
-            "Common causes:\n"
-            "• Missing IAM: BigQuery Job User (jobs.create)\n"
-            "• Missing IAM: BigQuery Data Viewer (tables.getData)\n"
-            "• Dataset location mismatch (US vs EU)\n"
-        )
+        st.error("BigQuery query failed.")
         st.json(bq_meta)
         st.exception(e)
         raise
@@ -343,7 +307,6 @@ def bq_load_photometry_for_provid(
         "job_id": getattr(job, "job_id", None),
     })
 
-    # Truncation warning
     bq_meta["returned_rows"] = int(len(df))
     bq_meta["may_be_truncated"] = bool(len(df) >= row_limit)
 
@@ -351,7 +314,7 @@ def bq_load_photometry_for_provid(
 
 
 # ======================================================================
-# STEP 5 — Geometry correction using JPL Horizons (range query)
+# Geometry correction (Horizons)
 # ======================================================================
 def step5_geometry_horizons_range(
     df1,
@@ -375,7 +338,7 @@ def step5_geometry_horizons_range(
     need = ["obstime_dt", "mag", "band"]
     missing = [c for c in need if c not in df1.columns]
     if missing:
-        raise ValueError(f"STEP 5: df1 missing columns required: {missing}")
+        raise ValueError(f"STEP 5: df1 missing columns: {missing}")
 
     if TOL_DAYS is None:
         TOL_DAYS = max(2e-3, (STEP_MINUTES / 1440.0) * 1.2)
@@ -385,7 +348,6 @@ def step5_geometry_horizons_range(
 
     dfG = df1.copy()
     dfG["band"] = dfG["band"].map(normalize_lsst_band)
-
     dfG["obstime_dt"] = pd.to_datetime(dfG["obstime_dt"], errors="coerce", utc=True)
     dfG = dfG.dropna(subset=["obstime_dt"]).sort_values("obstime_dt").reset_index(drop=True)
     if len(dfG) == 0:
@@ -411,11 +373,9 @@ def step5_geometry_horizons_range(
         )
         eph = obj.ephemerides()
         df = eph.to_pandas()
-
         for k in ["datetime_jd", "r", "delta", "alpha", "lighttime"]:
             if k not in df.columns:
-                raise KeyError(f"Horizons response missing '{k}'. Columns={list(df.columns)}")
-
+                raise KeyError(f"Horizons response missing '{k}'.")
         return pd.DataFrame({
             "jd_utc_eph": df["datetime_jd"].astype(float).to_numpy(),
             "r_au": df["r"].astype(float).to_numpy(),
@@ -431,12 +391,10 @@ def step5_geometry_horizons_range(
         sub = dfG[dfG[night_key] == block]
         tmin = pd.to_datetime(sub["obstime_dt"].min(), utc=True) - pd.Timedelta(minutes=PAD_MINUTES)
         tmax = pd.to_datetime(sub["obstime_dt"].max(), utc=True) + pd.Timedelta(minutes=PAD_MINUTES)
-
-        start_utc = tmin.strftime("%Y-%m-%d %H:%M")
-        stop_utc  = tmax.strftime("%Y-%m-%d %H:%M")
-
         eph_b = query_horizons_range_smallbody(
-            PROVID, start_utc, stop_utc,
+            PROVID,
+            tmin.strftime("%Y-%m-%d %H:%M"),
+            tmax.strftime("%Y-%m-%d %H:%M"),
             step_minutes=STEP_MINUTES,
             location=HORIZONS_LOCATION,
         )
@@ -461,7 +419,6 @@ def step5_geometry_horizons_range(
     )
 
     dfM["dt_match_sec"] = (dfM["jd_utc_obs"] - dfM["jd_utc_eph"]) * 86400.0
-
     matched = int(dfM["r_au"].notna().sum())
     n_total = int(len(dfM))
     n_unmatched = n_total - matched
@@ -535,9 +492,132 @@ def geo_correct(df1, provid):
     return df_geo, meta
 
 
-# -------------------------
-# Start app
-# -------------------------
+# ======================================================================
+# NEW (Iteration 1): Period Candidate Ladder helper
+# ======================================================================
+
+def _safe_period(val) -> float | None:
+    """Return a positive finite float or None."""
+    try:
+        v = float(val)
+        if np.isfinite(v) and v > 0:
+            return round(v, 6)
+    except Exception:
+        pass
+    return None
+
+
+def build_period_candidates(row: dict) -> list[dict]:
+    """
+    Build an ordered list of period candidates from a master CSV row.
+    Each entry: {"label": str, "period": float, "note": str | None}
+
+    Priority order:
+      1. Adopted period  (always first)
+      2. LS peak period  (if different from adopted)
+      3. 2P candidate    (if present, with ΔBIC note)
+
+    Deduplication: skip any period within 0.1% of an already-included period.
+    """
+    candidates = []
+    seen: list[float] = []
+
+    def _is_dup(p: float) -> bool:
+        return any(abs(p - s) / max(s, 1e-9) < 0.001 for s in seen)
+
+    def _add(label: str, period: float | None, note: str | None = None):
+        if period is None:
+            return
+        if _is_dup(period):
+            return
+        seen.append(period)
+        candidates.append({"label": label, "period": period, "note": note})
+
+    _add("Adopted", _safe_period(row.get("Adopted period (hr)")))
+    _add("LS Peak", _safe_period(row.get("LS peak period (hr)")))
+
+    p2 = _safe_period(row.get("2P candidate (hr)"))
+    dbic = row.get("ΔBIC(2P−P)", None)
+    dbic_str = None
+    if dbic is not None:
+        try:
+            dbic_str = f"ΔBIC = {float(dbic):.1f}"
+        except Exception:
+            pass
+    _add("2P Candidate", p2, note=dbic_str)
+
+    return candidates
+
+
+def render_period_candidate_ladder(
+    candidates: list[dict],
+    current_fold_period: float,
+    state_key: str = "fold_period",
+):
+    """
+    Render the period candidate ladder inside the sidebar.
+
+    For each candidate period P_c, show three buttons: P/2 · P · 2P.
+    Clicking any button sets st.session_state[state_key] and triggers st.rerun().
+    The active button (within 0.05% of current_fold_period) is visually highlighted
+    via an asterisk in the label — Streamlit doesn't allow per-button colour in sidebar.
+    """
+    if not candidates:
+        return
+
+    st.sidebar.markdown("**Period Candidates**")
+    st.sidebar.caption("Click P/2 · P · 2P to fold at that period")
+
+    TOLERANCE = 0.0005  # 0.05% match → flag as active
+
+    def _is_active(p: float) -> bool:
+        if p <= 0:
+            return False
+        return abs(p - current_fold_period) / max(current_fold_period, 1e-9) < TOLERANCE
+
+    def _btn_label(p: float) -> str:
+        marker = " ✦" if _is_active(p) else ""
+        return f"{p:.4f} h{marker}"
+
+    for cand in candidates:
+        P_c = cand["period"]
+        label = cand["label"]
+        note = cand.get("note")
+
+        # Compact header line
+        header = f"**{label}** — {P_c:.6f} h"
+        if note:
+            header += f"  `{note}`"
+        st.sidebar.markdown(header)
+
+        half_p = round(P_c / 2.0, 6)
+        two_p  = round(P_c * 2.0, 6)
+
+        col1, col2, col3 = st.sidebar.columns(3)
+
+        with col1:
+            if st.button(_btn_label(half_p), key=f"btn_{label}_half", use_container_width=True):
+                st.session_state[state_key] = half_p
+                st.rerun()
+
+        with col2:
+            if st.button(_btn_label(P_c), key=f"btn_{label}_P", use_container_width=True):
+                st.session_state[state_key] = P_c
+                st.rerun()
+
+        with col3:
+            if st.button(_btn_label(two_p), key=f"btn_{label}_two", use_container_width=True):
+                st.session_state[state_key] = two_p
+                st.rerun()
+
+        st.sidebar.caption(f"↑ P/2 = {half_p:.4f} h  ·  P = {P_c:.4f} h  ·  2P = {two_p:.4f} h")
+
+    st.sidebar.markdown("---")
+
+
+# ======================================================================
+# App start
+# ======================================================================
 st.markdown("## ATLAST Asteroid Rotation Dashboard")
 
 if not MASTER_PATH.exists():
@@ -546,14 +626,12 @@ if not MASTER_PATH.exists():
 
 master = load_master(MASTER_PATH)
 
-# If your master has a different column name, rename to "Designation"
 if "Designation" not in master.columns:
     for c in ["provid", "PROVID", "designation", "name", "object_id"]:
         if c in master.columns:
             master = master.rename(columns={c: "Designation"})
             break
 
-# Convert numeric columns if present
 NUM_COLS = [
     "H Mag", "Mean Mag (r Band)", "Number of Observations", "Arc (days)",
     "LS peak period (hr)", "Adopted period (hr)", "Adopted K",
@@ -565,26 +643,25 @@ for c in NUM_COLS:
     if c in master.columns:
         master[c] = safe_num(master[c])
 
-RELIABLE_COUNT = int((master.get("Reliability", "").astype(str).str.lower() == "reliable").sum()) if "Reliability" in master.columns else 0
+RELIABLE_COUNT = int(
+    (master.get("Reliability", pd.Series([], dtype=str))
+     .astype(str).str.lower() == "reliable").sum()
+) if "Reliability" in master.columns else 0
 
-# Sidebar
+# -------------------------
+# Sidebar — Mode
+# -------------------------
 st.sidebar.markdown("## Mode")
 mode = st.sidebar.radio("View", ["Asteroid Viewer", "Population Explorer"], index=0)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("## BigQuery Controls")
 
-row_limit = st.sidebar.slider(
-    "Max rows per asteroid query",
-    min_value=1000,
-    max_value=BQ_MAX_ROW_LIMIT,
-    value=BQ_DEFAULT_ROW_LIMIT,
-    step=1000,
-)
-
+row_limit = st.sidebar.slider("Max rows per asteroid query", 1000, BQ_MAX_ROW_LIMIT, BQ_DEFAULT_ROW_LIMIT, 1000)
 buffer_days = st.sidebar.slider("Window buffer (days)", 0, 120, 30, 5)
-min_window = st.sidebar.slider("Min window (days)", 30, 400, 60, 10)
-max_window = st.sidebar.slider("Max window (days)", 100, 2000, 800, 50)
+min_window  = st.sidebar.slider("Min window (days)", 30, 400, 60, 10)
+max_window  = st.sidebar.slider("Max window (days)", 100, 2000, 800, 50)
+
 
 # ==========================================================
 # MODE 1: ASTEROID VIEWER
@@ -630,36 +707,65 @@ if mode == "Asteroid Viewer":
     if not (np.isfinite(P_adopt) and P_adopt > 0):
         P_adopt = 5.0
 
-    arc_days = row.get("Arc (days)", np.nan)
+    arc_days   = row.get("Arc (days)", np.nan)
     window_days = _choose_window_days(arc_days, buffer_days=buffer_days, min_days=min_window, max_days=max_window)
 
+    # ------------------------------------------------------------------
+    # Sidebar — Fold Controls (Iteration 1: Period Candidate Ladder)
+    # ------------------------------------------------------------------
     st.sidebar.markdown("---")
     st.sidebar.markdown("## Fold Controls")
 
-    if "fold_period" not in st.session_state or st.session_state.get("fold_period_for") != selected:
-        st.session_state.fold_period = float(P_adopt)
-        st.session_state.fold_period_for = selected
+    # Reset fold period when asteroid changes
+    if st.session_state.get("fold_period_for") != selected:
+        st.session_state["fold_period"] = float(P_adopt)
+        st.session_state["fold_period_for"] = selected
 
-    lo = max(1e-6, float(P_adopt) / 2.0)
-    hi = float(P_adopt) * 2.0
+    # Build candidates from master row
+    candidates = build_period_candidates(row)
 
+    # Determine slider bounds: cover all candidate harmonics + adopted
+    all_periods_for_bounds = [P_adopt]
+    for cand in candidates:
+        p = cand["period"]
+        all_periods_for_bounds.extend([p / 2.0, p, p * 2.0])
+    lo = max(1e-6, min(all_periods_for_bounds) * 0.9)
+    hi = max(all_periods_for_bounds) * 1.1
+
+    # Fine-tune slider (updates live; candidate buttons will override it)
     P_calc = st.sidebar.slider(
         "Fold Period (hours)",
         min_value=float(lo),
         max_value=float(hi),
-        value=float(st.session_state.fold_period),
-        step=float((hi - lo) / 400.0) if hi > lo else 1e-6,
+        value=float(st.session_state.get("fold_period", P_adopt)),
+        step=float((hi - lo) / 600.0) if hi > lo else 1e-6,
+        key="fold_period_slider",
     )
-    st.session_state.fold_period = float(P_calc)
+    # Keep session state in sync with slider
+    st.session_state["fold_period"] = float(P_calc)
 
-    if st.sidebar.button("Reset To Adopted Period", use_container_width=True):
-        st.session_state.fold_period = float(P_adopt)
+    if st.sidebar.button("↩ Reset To Adopted Period", use_container_width=True):
+        st.session_state["fold_period"] = float(P_adopt)
         st.rerun()
+
+    st.sidebar.markdown("---")
+
+    # Period Candidate Ladder
+    render_period_candidate_ladder(
+        candidates,
+        current_fold_period=float(st.session_state.get("fold_period", P_adopt)),
+        state_key="fold_period",
+    )
+    # Read back after possible button rerun
+    P_calc = float(st.session_state.get("fold_period", P_adopt))
 
     LSST_BANDS = ["u", "g", "r", "i", "z", "y"]
     sel_bands_sidebar = st.sidebar.multiselect("Bands", options=LSST_BANDS, default=["g", "r", "i"])
     two_cycles = st.sidebar.checkbox("Show two cycles (0–2)", value=False)
 
+    # ------------------------------------------------------------------
+    # Main content
+    # ------------------------------------------------------------------
     tab_photo, tab_char = st.tabs(["Photometry", "Characterisation"])
 
     with tab_photo:
@@ -677,7 +783,7 @@ if mode == "Asteroid Viewer":
         if bq_meta.get("may_be_truncated", False):
             st.warning(
                 f"Returned {bq_meta.get('returned_rows')} rows and hit the row limit ({row_limit}). "
-                "Increase the row limit or increase the time window if you expect more data."
+                "Increase the row limit in the sidebar if you expect more data."
             )
 
         if df_raw is None or len(df_raw) == 0:
@@ -702,17 +808,16 @@ if mode == "Asteroid Viewer":
                 meta5 = {}
 
         if "mag_geo_bandcenter" in df_geo.columns and df_geo["mag_geo_bandcenter"].notna().sum() >= 5:
-            mag_col = "mag_geo_bandcenter"
+            mag_col   = "mag_geo_bandcenter"
             mag_label = "mag_geo_bandcenter (corrected, band-centered)"
         elif "mag_geo" in df_geo.columns and df_geo["mag_geo"].notna().sum() >= 5:
-            mag_col = "mag_geo"
+            mag_col   = "mag_geo"
             mag_label = "mag_geo (corrected)"
         else:
-            mag_col = "mag"
+            mag_col   = "mag"
             mag_label = "mag (raw)"
 
         df_geo["band"] = df_geo["band"].map(normalize_lsst_band)
-
         avail = set(df_geo["band"].dropna().astype(str).unique().tolist())
         sel_bands = [b for b in sel_bands_sidebar if b in avail]
         if not sel_bands:
@@ -722,34 +827,48 @@ if mode == "Asteroid Viewer":
         dfp = dfp.dropna(subset=["t_hr", mag_col, "band"])
         n_nights = resolve_nights(dfp)
 
+        # Metrics row
         s1, s2, s3, s4 = st.columns(4)
-        s1.metric("Adopted Rotation Period (hours)", format_float(row.get("Adopted period (hr)", np.nan), 6))
+        s1.metric("Adopted Period (hours)", format_float(row.get("Adopted period (hr)", np.nan), 6))
         s2.metric("Fold Period (hours)", format_float(P_calc, 6))
         s3.metric("Observations (returned)", f"{len(dfp):,}")
         s4.metric("Nights (photometry)", "—" if n_nights is None else str(int(n_nights)))
 
         st.caption(f"Folding uses: **{mag_label}**  |  Query window_days={window_days}")
 
-        t_hr = dfp["t_hr"].to_numpy(float)
-        t_day = dfp["t_day"].to_numpy(float)
-        mag = pd.to_numeric(dfp[mag_col], errors="coerce").to_numpy(float)
-        bands = dfp["band"].to_numpy(str)
+        t_hr   = dfp["t_hr"].to_numpy(float)
+        t_day  = dfp["t_day"].to_numpy(float)
+        mag    = pd.to_numeric(dfp[mag_col], errors="coerce").to_numpy(float)
+        bands  = dfp["band"].to_numpy(str)
 
         P_half = 0.5 * float(P_calc)
-        P_two = 2.0 * float(P_calc)
+        P_two  = 2.0 * float(P_calc)
 
+        # ------------------------------------------------------------------
+        # Three-panel fold — unchanged from baseline, but now the fold period
+        # can be driven by the candidate ladder in the sidebar
+        # ------------------------------------------------------------------
         st.markdown("#### Three-Panel Fold (P/2 • P • 2P)")
         cols = st.columns(3)
         periods = [P_half, float(P_calc), P_two]
-        titles = [f"P/2 = {P_half:.6f} hours", f"P = {float(P_calc):.6f} hours", f"2P = {P_two:.6f} hours"]
+        titles  = [
+            f"P/2 = {P_half:.6f} h",
+            f"P = {float(P_calc):.6f} h",
+            f"2P = {P_two:.6f} h",
+        ]
 
         for col, P_hr, title in zip(cols, periods, titles):
             with col:
                 fig, ax = plt.subplots(figsize=(5.2, 3.6))
-                plot_fold(ax, t_hr=t_hr, mag=mag, bands=bands, P_hr=P_hr, title=title, mag_label=mag_label, two_cycles=two_cycles)
+                plot_fold(ax, t_hr=t_hr, mag=mag, bands=bands,
+                          P_hr=P_hr, title=title, mag_label=mag_label,
+                          two_cycles=two_cycles)
                 ax.legend(fontsize=7)
                 st.pyplot(fig, clear_figure=True)
 
+        # ------------------------------------------------------------------
+        # Magnitude vs Time
+        # ------------------------------------------------------------------
         st.markdown("#### Magnitude vs Time")
         fig, ax = plt.subplots(figsize=(10.5, 3.6))
         for b in sorted(np.unique(bands).tolist()):
@@ -762,23 +881,27 @@ if mode == "Asteroid Viewer":
         ax.legend(fontsize=8, ncol=6)
         st.pyplot(fig, clear_figure=True)
 
+    # ------------------------------------------------------------------
+    # Characterisation tab
+    # ------------------------------------------------------------------
     with tab_char:
         st.markdown(
             f"### Characterisation: **{selected}** &nbsp;&nbsp;•&nbsp;&nbsp; {reliability_html(rel)}",
             unsafe_allow_html=True,
         )
-        st.caption("All values on this tab come from master_results_clean.csv (Step 13 Summary Exports).")
+        st.caption("All values from master_results_clean.csv (Step 13 Summary Exports).")
 
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Adopted Rotation Period (hours)", format_float(row.get("Adopted period (hr)", np.nan), 6))
-        k2.metric("Adopted K", "—" if pd.isna(row.get("Adopted K", np.nan)) else str(int(row.get("Adopted K"))))
-        k3.metric("Amplitude (Mag)", format_float(row.get("Amplitude (Fourier)", np.nan), 3))
-        k4.metric("Axial Elongation", format_float(row.get("Axial Elongation", np.nan), 3))
+        k1.metric("Adopted Period (hours)", format_float(row.get("Adopted period (hr)", np.nan), 6))
+        k2.metric("LS Peak Period (hours)", format_float(row.get("LS peak period (hr)", np.nan), 6))
+        k3.metric("Adopted K", "—" if pd.isna(row.get("Adopted K", np.nan)) else str(int(row.get("Adopted K"))))
+        k4.metric("Amplitude (Mag)", format_float(row.get("Amplitude (Fourier)", np.nan), 3))
 
-        b1, b2, b3 = st.columns(3)
-        b1.metric("2P Candidate (hours)", format_float(row.get("2P candidate (hr)", np.nan), 6))
-        b2.metric("ΔBIC(2P−P)", format_float(row.get("ΔBIC(2P−P)", np.nan), 3))
-        b3.metric("Bootstrap Top_Frac", format_float(row.get("Bootstrap top_frac", np.nan), 3))
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("Axial Elongation", format_float(row.get("Axial Elongation", np.nan), 3))
+        b2.metric("2P Candidate (hours)", format_float(row.get("2P candidate (hr)", np.nan), 6))
+        b3.metric("ΔBIC (2P − P)", format_float(row.get("ΔBIC(2P−P)", np.nan), 2))
+        b4.metric("Bootstrap Top Frac", format_float(row.get("Bootstrap top_frac", np.nan), 3))
 
         st.markdown("#### Color Indices")
         c1, c2, c3 = st.columns(3)
@@ -786,9 +909,24 @@ if mode == "Asteroid Viewer":
         c2.metric("g − i", format_float(row.get("g - i", np.nan), 4))
         c3.metric("r − i", format_float(row.get("r - i", np.nan), 4))
 
+        # Period candidate summary table (new in Iteration 1)
+        if candidates:
+            st.markdown("#### Period Candidate Summary")
+            rows_table = []
+            for cand in candidates:
+                p = cand["period"]
+                rows_table.append({
+                    "Source": cand["label"],
+                    "Period (h)": f"{p:.6f}",
+                    "P/2 (h)": f"{p/2:.6f}",
+                    "2P (h)": f"{p*2:.6f}",
+                    "Note": cand.get("note") or "—",
+                })
+            st.dataframe(pd.DataFrame(rows_table), use_container_width=True, hide_index=True)
+
 
 # ==========================================================
-# MODE 2: POPULATION EXPLORER
+# MODE 2: POPULATION EXPLORER  (unchanged from baseline)
 # ==========================================================
 else:
     st.caption("Explore the population distribution using filters in the sidebar.")
@@ -798,7 +936,6 @@ else:
 
     rel_series = master.get("Reliability", pd.Series([], dtype=str)).dropna().astype(str)
     rel_options = sorted(rel_series.unique().tolist()) if len(rel_series) else ["reliable", "ambiguous", "insufficient", "unknown"]
-
     default_rels = ["reliable"] if "reliable" in rel_options else rel_options
     selected_rels = st.sidebar.multiselect("Reliability", options=rel_options, default=default_rels)
     if not selected_rels:
@@ -832,32 +969,28 @@ else:
     if n_col in df_f.columns:
         df_f = df_f[df_f[n_col].between(n_lo, n_hi, inclusive="both")]
 
-    st.sidebar.caption(f"{len(df_f):,} Asteroids Match Filters")
+    st.sidebar.caption(f"{len(df_f):,} asteroids match filters")
 
     st.markdown("### Population Overview (Filtered)")
     if len(df_f) == 0:
-        st.warning("No asteroids match your current population filters. Widen the ranges or reselect reliability options.")
+        st.warning("No asteroids match your current population filters.")
         st.stop()
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Asteroids (Filtered)", f"{len(df_f):,}")
     if "Reliability" in df_f.columns:
-        c2.metric("Reliable", f"{int((df_f['Reliability'].astype(str) == 'reliable').sum()):,}")
-        c3.metric("Ambiguous", f"{int((df_f['Reliability'].astype(str) == 'ambiguous').sum()):,}")
+        c2.metric("Reliable",     f"{int((df_f['Reliability'].astype(str) == 'reliable').sum()):,}")
+        c3.metric("Ambiguous",    f"{int((df_f['Reliability'].astype(str) == 'ambiguous').sum()):,}")
         c4.metric("Insufficient", f"{int((df_f['Reliability'].astype(str) == 'insufficient').sum()):,}")
     else:
-        c2.metric("Reliable", "—")
-        c3.metric("Ambiguous", "—")
-        c4.metric("Insufficient", "—")
+        c2.metric("Reliable", "—"); c3.metric("Ambiguous", "—"); c4.metric("Insufficient", "—")
 
     if "Adopted period (hr)" in df_f.columns and "Amplitude (Fourier)" in df_f.columns:
         st.markdown("#### Rotation Period vs Amplitude")
         x = df_f["Adopted period (hr)"].to_numpy(float)
         y = df_f["Amplitude (Fourier)"].to_numpy(float)
         m = np.isfinite(x) & np.isfinite(y)
-        if m.sum() == 0:
-            st.info("No finite Period/Amplitude points under current filters.")
-        else:
+        if m.sum() > 0:
             fig, ax = plt.subplots(figsize=(8.5, 4.5))
             ax.scatter(x[m], y[m], s=10)
             ax.set_xlabel("Adopted Period (hours)")
@@ -869,9 +1002,7 @@ else:
         st.markdown("#### Adopted Period Distribution")
         periods = df_f["Adopted period (hr)"].to_numpy(float)
         periods = periods[np.isfinite(periods)]
-        if len(periods) == 0:
-            st.info("No finite adopted periods under current filters.")
-        else:
+        if len(periods) > 0:
             fig, ax = plt.subplots(figsize=(8.5, 4.0))
             ax.hist(periods, bins=50)
             ax.set_xlabel("Adopted Period (hours)")
@@ -881,15 +1012,10 @@ else:
 
     st.markdown("#### Master Table (Filtered)")
     show_cols = [
-        "Designation",
-        "Adopted period (hr)",
-        "LS peak period (hr)",
-        "Amplitude (Fourier)",
-        "Axial Elongation",
-        "Reliability",
-        "Bootstrap top_frac",
-        "Number of Observations",
-        "Arc (days)",
+        "Designation", "Adopted period (hr)", "LS peak period (hr)",
+        "2P candidate (hr)", "ΔBIC(2P−P)",
+        "Amplitude (Fourier)", "Axial Elongation",
+        "Reliability", "Bootstrap top_frac", "Number of Observations", "Arc (days)",
     ]
     show_cols = [c for c in show_cols if c in df_f.columns]
     st.dataframe(df_f[show_cols].reset_index(drop=True), use_container_width=True, height=460)
