@@ -254,62 +254,7 @@ def build_period_candidates(row: dict) -> list[dict]:
     return candidates
 
 
-def render_period_candidate_ladder(
-    candidates: list[dict],
-    current_fold_period: float,
-    state_key: str = "fold_period",
-):
-    """
-    Render clickable P/2 · P · 2P buttons per candidate in the sidebar.
-    Active period (within 0.05%) gets a ✦ marker.
-    """
-    if not candidates:
-        return
 
-    st.sidebar.markdown("**Period Candidates**")
-    st.sidebar.caption("Click any button to fold at that period")
-
-    TOL = 0.0005
-
-    def _active(p: float) -> bool:
-        return p > 0 and abs(p - current_fold_period) / max(current_fold_period, 1e-9) < TOL
-
-    def _lbl(p: float) -> str:
-        return f"{p:.4f} h{'  ✦' if _active(p) else ''}"
-
-    for cand in candidates:
-        P_c  = cand["period"]
-        note = cand.get("note")
-        badge = " ★" if cand.get("is_adopted") else ""
-
-        header = f"**{cand['label']}{badge}** — {P_c:.6f} h"
-        if note:
-            header += f"  `{note}`"
-        st.sidebar.markdown(header)
-
-        half_p = round(P_c / 2.0, 6)
-        two_p  = round(P_c * 2.0, 6)
-
-        c1, c2, c3 = st.sidebar.columns(3)
-        with c1:
-            if st.button(_lbl(half_p), key=f"btn_{cand['label']}_half", use_container_width=True):
-                st.session_state[state_key] = half_p
-                st.session_state["fold_period_slider"] = half_p
-                st.rerun()
-        with c2:
-            if st.button(_lbl(P_c), key=f"btn_{cand['label']}_P", use_container_width=True):
-                st.session_state[state_key] = P_c
-                st.session_state["fold_period_slider"] = P_c
-                st.rerun()
-        with c3:
-            if st.button(_lbl(two_p), key=f"btn_{cand['label']}_two", use_container_width=True):
-                st.session_state[state_key] = two_p
-                st.session_state["fold_period_slider"] = two_p
-                st.rerun()
-
-        st.sidebar.caption(f"P/2={half_p:.4f}  ·  P={P_c:.4f}  ·  2P={two_p:.4f}")
-
-    st.sidebar.markdown("---")
 
 
 # ============================================================
@@ -416,7 +361,7 @@ def bq_load_photometry_for_provid(provid, *, window_days, row_limit):
         est = int(getattr(dry, "total_bytes_processed", 0) or 0)
         bq_meta.update({"dry_run_ok": True,
                          "estimated_bytes_human": bytes_to_human(est),
-                         "estimated_cost_usd": est_usd_cost(est)})
+                         "estimated_cost_usd": round(est_usd_cost(est), 6)})
     except Exception as e:
         st.error("BigQuery dry-run failed.")
         st.exception(e)
@@ -434,12 +379,24 @@ def bq_load_photometry_for_provid(provid, *, window_days, row_limit):
 
     actual = int(getattr(job, "total_bytes_processed", 0) or 0)
     bq_meta.update({"actual_bytes_human": bytes_to_human(actual),
-                     "actual_cost_usd": est_usd_cost(actual),
+                     "actual_cost_usd": round(est_usd_cost(actual), 6),
                      "cache_hit": bool(getattr(job, "cache_hit", False)),
                      "job_id": getattr(job, "job_id", None),
                      "returned_rows": len(df),
                      "may_be_truncated": len(df) >= row_limit})
     return df, bq_meta
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def bq_fetch_cached(provid: str, window_days: int, row_limit: int):
+    """
+    Cached BQ fetch — same (provid, window_days, row_limit) within 1 hour
+    costs zero BQ bytes. Streamlit serves from in-process memory.
+    This is the primary cost-reduction mechanism for public viewers.
+    """
+    return bq_load_photometry_for_provid(provid,
+                                          window_days=window_days,
+                                          row_limit=row_limit)
 
 
 def make_df1_from_bq(df_raw):
@@ -656,7 +613,6 @@ if mode == "Asteroid Viewer":
     st.sidebar.markdown("## Fold Controls")
 
     if st.session_state.get("fold_period_for") != selected:
-        # Clear cached photometry for the previous asteroid
         old = st.session_state.get("fold_period_for")
         if old:
             for k in list(st.session_state.keys()):
@@ -668,36 +624,36 @@ if mode == "Asteroid Viewer":
 
     candidates = build_period_candidates(row)
 
-    # Slider bounds: span all candidate harmonics
+    # Slider range covers adopted P, all alt candidates and their harmonics
     all_bounds = [P_adopt]
     for cand in candidates:
         p = cand["period"]
         all_bounds.extend([p / 2.0, p, p * 2.0])
-    lo = max(1e-6, min(all_bounds) * 0.9)
-    hi = max(all_bounds) * 1.1
+    lo   = max(1e-6, min(all_bounds) * 0.9)
+    hi   = max(all_bounds) * 1.1
+    step = float((hi - lo) / 600.0) if hi > lo else 1e-6
+
+    # Pre-set key before rendering to avoid Streamlit double-set warning
+    current_p = float(st.session_state.get("fold_period", P_adopt))
+    clamped   = float(np.clip(current_p, lo, hi))
+    clamped   = round(round((clamped - lo) / step) * step + lo, 8)
+    clamped   = float(np.clip(clamped, lo, hi))
+    st.session_state["fold_period_slider"] = clamped
+    st.session_state["fold_period"]        = clamped
 
     P_calc = st.sidebar.slider(
         "Fold Period (hours)",
         min_value=float(lo),
         max_value=float(hi),
-        value=float(st.session_state.get("fold_period", P_adopt)),
-        step=float((hi - lo) / 600.0) if hi > lo else 1e-6,
+        step=step,
         key="fold_period_slider",
     )
     st.session_state["fold_period"] = float(P_calc)
 
     if st.sidebar.button("↩ Reset To Adopted Period", use_container_width=True):
-        st.session_state["fold_period"] = float(P_adopt)
+        st.session_state["fold_period"]        = float(P_adopt)
         st.session_state["fold_period_slider"] = float(P_adopt)
         st.rerun()
-
-    st.sidebar.markdown("---")
-    render_period_candidate_ladder(
-        candidates,
-        current_fold_period=float(st.session_state.get("fold_period", P_adopt)),
-        state_key="fold_period",
-    )
-    P_calc = float(st.session_state.get("fold_period", P_adopt))
 
     LSST_BANDS = ["u", "g", "r", "i", "z", "y"]
     sel_bands_sidebar = st.sidebar.multiselect("Bands", LSST_BANDS, default=["g", "r", "i"])
@@ -720,13 +676,26 @@ if mode == "Asteroid Viewer":
     # Results are stored in session_state so that changing the fold
     # period (buttons, slider) never triggers a re-query.
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Fetch photometry — two-layer cache:
+    #   Layer 1: @st.cache_data (process-level, 1-hour TTL)
+    #            Multiple users viewing the same asteroid within 1 hour
+    #            pay zero BQ bytes after the first load.
+    #   Layer 2: st.session_state (per-session)
+    #            Fold period changes and button clicks never re-query.
+    #
+    # Cost note: with the partition-pruning WHERE clause, each query
+    # typically scans 5–40 MB per asteroid (~$0.00025 max at $5/TB).
+    # The @st.cache_data layer means the real cost per asteroid is
+    # incurred at most once per hour across all viewers.
+    # ------------------------------------------------------------------
     cache_key = f"_phot_{selected}_{window_days}_{row_limit}"
 
     if cache_key not in st.session_state:
-        with st.spinner(f"Querying BigQuery (window={window_days}d, limit={row_limit}) ..."):
+        with st.spinner(f"Loading photometry for {selected} ..."):
             try:
-                df_raw, bq_meta = bq_load_photometry_for_provid(
-                    str(selected), window_days=window_days, row_limit=row_limit)
+                df_raw, bq_meta = bq_fetch_cached(
+                    str(selected), window_days, row_limit)
             except Exception:
                 df_raw, bq_meta = None, {}
 
@@ -748,10 +717,10 @@ if mode == "Asteroid Viewer":
             "meta5":   meta5,
         }
 
-    cached     = st.session_state[cache_key]
-    bq_meta    = cached["bq_meta"]
-    df_geo     = cached["df_geo"]
-    meta5      = cached["meta5"]
+    cached  = st.session_state[cache_key]
+    bq_meta = cached["bq_meta"]
+    df_geo  = cached["df_geo"]
+    meta5   = cached["meta5"]
 
     with tab_photo:
         # Header with reliability badge + 2P flag + human review warning
@@ -779,7 +748,13 @@ if mode == "Asteroid Viewer":
         if prefer_2p and row.get(C_PREFER_2P_R):
             st.info(f"Pipeline 2P preference: *{row[C_PREFER_2P_R]}*")
 
-        with st.expander("BigQuery Cost & Query Diagnostics", expanded=False):
+        with st.expander("BigQuery diagnostics & cost", expanded=False):
+            if bq_meta.get("cache_hit") or bq_meta.get("actual_cost_usd", 1) == 0:
+                st.success("Served from cache — $0.00 billed this load")
+            else:
+                cost = bq_meta.get("actual_cost_usd", 0)
+                scanned = bq_meta.get("actual_bytes_human", "—")
+                st.caption(f"Scanned: {scanned} · Est. cost: ${cost:.6f}")
             st.json(bq_meta)
 
         if bq_meta.get("may_be_truncated"):
@@ -811,6 +786,19 @@ if mode == "Asteroid Viewer":
         s4.metric("Nights",               "—" if n_nights is None else str(n_nights))
 
         st.caption(f"Folding: **{mag_label}** · window_days={window_days}")
+
+        # ---- Alternative period candidates (read-only info panel) ----
+        alt_candidates = [c for c in candidates if not c.get("is_adopted")]
+        if alt_candidates:
+            with st.expander(f"Alternative period candidates ({len(alt_candidates)})", expanded=True):
+                cols = st.columns(min(len(alt_candidates), 4))
+                for col, cand in zip(cols, alt_candidates):
+                    p    = cand["period"]
+                    note = cand.get("note") or ""
+                    col.metric(label=cand["label"], value=f"{p:.6f} h")
+                    if note:
+                        col.caption(note)
+                st.caption("Use the **Fold Period slider** in the sidebar to fold at any of these periods.")
 
         t_hr  = dfp["t_hr"].to_numpy(float)
         t_day = dfp["t_day"].to_numpy(float)
