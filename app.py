@@ -188,17 +188,32 @@ def build_period_candidates(row: dict) -> list[dict]:
       {"label": str, "period": float, "note": str | None, "is_adopted": bool}
 
     Order:
-      1. Adopted period (Period column)  — always first
-      2. Additional periods (pipe-list)  — each with its dBIC note
-      3. Boot harmonic winner            — if flagged and distinct
+      1. Adopted period — always first
+      2. Additional periods from pipeline — each with dBIC note,
+         BUT skip any that are within 2% of P/2, P, or 2P of the adopted period
+         (those are already shown in the three-panel fold and are redundant)
+      3. Boot harmonic winner — if flagged and genuinely distinct
 
-    Deduplication: skip any period within 0.1% of an already-seen one.
+    Deduplication: also skip any period within 0.5% of an already-included one.
     """
     candidates: list[dict] = []
     seen: list[float] = []
 
+    P_adopt = _safe_period(row.get(C_PERIOD)) or 0.0
+
+    # Periods that are already covered by the three-panel fold
+    PANEL_HARMONICS = [0.5, 1.0, 2.0]
+    HARMONIC_TOL    = 0.02   # 2% tolerance
+
+    def _is_panel_harmonic(p: float) -> bool:
+        """True if p is within 2% of P/2, P, or 2P of the adopted period."""
+        if P_adopt <= 0:
+            return False
+        ratio = p / P_adopt
+        return any(abs(ratio - h) / h < HARMONIC_TOL for h in PANEL_HARMONICS)
+
     def _is_dup(p: float) -> bool:
-        return any(abs(p - s) / max(s, 1e-9) < 0.001 for s in seen)
+        return any(abs(p - s) / max(s, 1e-9) < 0.005 for s in seen)
 
     def _add(label: str, period: float | None, note: str | None = None, is_adopted: bool = False):
         if period is None:
@@ -216,19 +231,25 @@ def build_period_candidates(row: dict) -> list[dict]:
     # 1. Adopted
     _add("Adopted", _safe_period(row.get(C_PERIOD)), is_adopted=True)
 
-    # 2. Additional periods from pipeline (with per-period dBIC)
+    # 2. Additional periods — skip those already covered by the three-panel fold
     add_periods = parse_pipe_list(row.get(C_ADDITIONAL))
     add_dbics   = parse_pipe_list(row.get(C_ADD_DBIC))
 
+    alt_idx = 1
     for i, p in enumerate(add_periods):
+        if _is_panel_harmonic(p):
+            continue   # already shown as P/2 or 2P panel — skip
         dbic_note = None
         if i < len(add_dbics):
             dbic_note = f"dBIC = {add_dbics[i]:.2f}"
-        _add(f"Alt {i+1}", p, note=dbic_note)
+        _add(f"Alt {alt_idx}", p, note=dbic_note)
+        alt_idx += 1
 
-    # 3. Bootstrap harmonic winner (if distinct)
+    # 3. Bootstrap harmonic winner — only if genuinely distinct
     if row.get(C_BOOT_HW_FLAG):
-        _add("Boot harmonic", _safe_period(row.get(C_BOOT_HW_P)), note="bootstrap winner")
+        p_hw = _safe_period(row.get(C_BOOT_HW_P))
+        if p_hw and not _is_panel_harmonic(p_hw):
+            _add("Boot harmonic", p_hw, note="bootstrap winner")
 
     return candidates
 
@@ -581,18 +602,10 @@ RELIABLE_COUNT = int((master[C_RELIABILITY].astype(str).str.lower() == "reliable
     if C_RELIABILITY in master.columns else 0
 
 # -------------------------
-# Sidebar — Mode
+# Sidebar — Mode (BigQuery Controls rendered later, at bottom)
 # -------------------------
 st.sidebar.markdown("## Mode")
 mode = st.sidebar.radio("View", ["Asteroid Viewer", "Population Explorer"], index=0)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("## BigQuery Controls")
-
-row_limit    = st.sidebar.slider("Max rows per query",   1000, BQ_MAX_ROW_LIMIT, BQ_DEFAULT_ROW_LIMIT, 1000)
-buffer_days  = st.sidebar.slider("Window buffer (days)", 0,    120,  30,  5)
-min_window   = st.sidebar.slider("Min window (days)",    30,   400,  60, 10)
-max_window   = st.sidebar.slider("Max window (days)",    100, 2000, 800, 50)
 
 
 # ============================================================
@@ -634,7 +647,6 @@ if mode == "Asteroid Viewer":
         P_adopt = 5.0
 
     arc_val     = row.get(C_ARC, np.nan)
-    window_days = _choose_window_days(arc_val, buffer_days, min_window, max_window)
 
     # ---- Fold Controls ----
     st.sidebar.markdown("---")
@@ -679,6 +691,15 @@ if mode == "Asteroid Viewer":
     LSST_BANDS = ["u", "g", "r", "i", "z", "y"]
     sel_bands_sidebar = st.sidebar.multiselect("Bands", LSST_BANDS, default=["g", "r", "i"])
     two_cycles = st.sidebar.checkbox("Show two cycles (0–2)", value=False)
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("## BigQuery Controls")
+    row_limit   = st.sidebar.slider("Max rows per query",   1000, BQ_MAX_ROW_LIMIT, BQ_DEFAULT_ROW_LIMIT, 1000)
+    buffer_days = st.sidebar.slider("Window buffer (days)", 0,    120,  30,  5)
+    min_window  = st.sidebar.slider("Min window (days)",    30,   400,  60, 10)
+    max_window  = st.sidebar.slider("Max window (days)",    100, 2000, 800, 50)
+
+    window_days = _choose_window_days(arc_val, buffer_days, min_window, max_window)
 
     # ---- Main tabs ----
     tab_photo, tab_char = st.tabs(["Photometry", "Characterisation"])
@@ -880,6 +901,13 @@ else:
                                     (float(max(0.0, pmin)), float(max(1.0, pmax))))
 
     prefer2p_filter = st.sidebar.checkbox("Pipeline-preferred 2P only", value=False)
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("## BigQuery Controls")
+    row_limit   = st.sidebar.slider("Max rows per query",   1000, BQ_MAX_ROW_LIMIT, BQ_DEFAULT_ROW_LIMIT, 1000)
+    buffer_days = st.sidebar.slider("Window buffer (days)", 0,    120,  30,  5)
+    min_window  = st.sidebar.slider("Min window (days)",    30,   400,  60, 10)
+    max_window  = st.sidebar.slider("Max window (days)",    100, 2000, 800, 50)
 
     df_f = master.copy()
     if C_RELIABILITY in df_f.columns:
