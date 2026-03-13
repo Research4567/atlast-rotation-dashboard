@@ -849,7 +849,7 @@ if mode == "Asteroid Viewer":
             if reason and reason != "nan":
                 st.info(f"Pipeline 2P preference: *{reason}*")
 
-        # ---- Physical Properties ----
+        # ---- 1. Physical Properties ----
         st.markdown('<p class="section-head">Physical Properties</p>', unsafe_allow_html=True)
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Adopted Period (h)", format_float(row.get(C_PERIOD), 6))
@@ -857,18 +857,27 @@ if mode == "Asteroid Viewer":
         k3.metric("H Mag",              format_float(row.get(C_HMAG), 2))
         k4.metric("Axial Elongation",   format_float(row.get(C_AXIAL), 3))
 
-        # ---- Three-panel fold ----
+        # ---- 2. Colour Indices ----
+        st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
+        st.markdown('<p class="section-head">Colour Indices</p>', unsafe_allow_html=True)
+        ci1, ci2, ci3, ci4 = st.columns(4)
+        ci1.metric("g − r", format_float(row.get(C_GR), 4))
+        ci2.metric("g − i", format_float(row.get(C_GI), 4))
+        ci3.metric("r − i", format_float(row.get(C_RI), 4))
+        ci4.metric("Mean Mag", format_float(row.get(C_MEAN_MAG), 3))
+
+        # ---- 3. Rotation Lightcurve (three-panel fold) ----
         if t_hr is not None:
             n_nights = resolve_nights(dfp)
             st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
             st.markdown('<p class="section-head">Rotation Lightcurve</p>', unsafe_allow_html=True)
 
-            sm1, sm2, sm3 = st.columns(3)
-            sm1.metric("Fold Period (h)", format_float(P_calc, 6))
-            sm2.metric("Observations", f"{len(dfp):,}")
-            sm3.metric("Nights", "—" if n_nights is None else str(n_nights))
-
-            st.caption(f"Folding **{mag_label}** magnitudes · bands: {', '.join(sel_bands)}")
+            st.caption(
+                f"Fold period: **{format_float(P_calc, 6)} h** · "
+                f"{len(dfp):,} obs · "
+                f"{n_nights if n_nights else '—'} nights · "
+                f"**{mag_label}** · bands: {', '.join(sel_bands)}"
+            )
 
             P_half, P_two = 0.5 * P_calc, 2.0 * P_calc
             for col, P_hr, title in zip(
@@ -885,7 +894,15 @@ if mode == "Asteroid Viewer":
         else:
             st.info("No photometry available for this asteroid.")
 
-        # ---- Period candidates ----
+        # ---- 4. Observations ----
+        st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
+        st.markdown('<p class="section-head">Observations</p>', unsafe_allow_html=True)
+        o1, o2, o3 = st.columns(3)
+        o1.metric("Observations", f"{int(row.get(C_NOBS, 0)):,}" if pd.notna(row.get(C_NOBS)) else "—")
+        o2.metric("Arc (days)",   format_float(row.get(C_ARC), 2))
+        o3.metric("Nights",      "—" if not (t_hr is not None and resolve_nights(dfp)) else str(resolve_nights(dfp)))
+
+        # ---- 5. Period Candidates ----
         alt_cands = [c for c in candidates if not c.get("is_adopted")]
         if alt_cands:
             st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
@@ -913,38 +930,13 @@ if mode == "Asteroid Viewer":
                     st.session_state["_set_p"] = p
                     st.rerun()
 
-        # ---- 2P Decision ----
+        # ---- 6. 2P Decision (compact) ----
         st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
-        st.markdown('<p class="section-head">2P Decision Summary</p>', unsafe_allow_html=True)
-        b1, b2, b3, b4 = st.columns(4)
-        b1.metric("Prefers 2P",         "Yes ✓" if prefer_2p else "No")
-        b2.metric("ΔBIC (2P vs P)",     format_float(row.get(C_DBIC_2P), 2))
-        b3.metric("OE Ratio",           format_float(row.get(C_OE_RATIO), 3))
-        b4.metric("Amp Ratio (2P/P)",   format_float(row.get(C_AMP_RATIO), 3))
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Bootstrap (base)",   format_float(row.get(C_BOOT_BASE), 3))
-        c2.metric("Bootstrap (2P)",     format_float(row.get(C_BOOT_2P), 3))
-        c3.metric("Family Boot Frac",   format_float(row.get(C_FAM_BOOT), 3))
-        c4.metric("Arc (days)",         format_float(row.get(C_ARC), 2))
-
-        # ---- Colour Indices ----
-        st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
-        st.markdown('<p class="section-head">Colour Indices</p>', unsafe_allow_html=True)
-        ci1, ci2, ci3, ci4 = st.columns(4)
-        ci1.metric("g − r", format_float(row.get(C_GR), 4))
-        ci2.metric("g − i", format_float(row.get(C_GI), 4))
-        ci3.metric("r − i", format_float(row.get(C_RI), 4))
-        ci4.metric("Mean Mag", format_float(row.get(C_MEAN_MAG), 3))
-
-        # ---- Observation Summary ----
-        st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
-        st.markdown('<p class="section-head">Observation Summary</p>', unsafe_allow_html=True)
-        o1, o2, o3, o4 = st.columns(4)
-        o1.metric("Observations", f"{int(row.get(C_NOBS, 0)):,}" if pd.notna(row.get(C_NOBS)) else "—")
-        o2.metric("Arc (days)",   format_float(row.get(C_ARC), 2))
-        o3.metric("Family ID",    str(row.get(C_FAM_ID, "—")))
-        o4.metric("Family Source", str(row.get(C_FAM_SRC, "—")))
+        st.markdown('<p class="section-head">Half-Period / 2P Analysis</p>', unsafe_allow_html=True)
+        b1, b2, b3 = st.columns(3)
+        b1.metric("Pipeline prefers 2P", "Yes ✓" if prefer_2p else "No")
+        b2.metric("ΔBIC (2P vs P)",      format_float(row.get(C_DBIC_2P), 2))
+        b3.metric("OE Ratio",            format_float(row.get(C_OE_RATIO), 3))
 
     # ==================================================================
     # TAB 2 — EVIDENCE
