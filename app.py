@@ -109,6 +109,32 @@ section[data-testid="stSidebar"] .stMarkdown h2 {
     font-size: 1.05rem; font-weight: 700; color: #334155;
     margin: 0.8rem 0 0.3rem 0; letter-spacing: -0.01em;
 }
+
+/* Colour index cards — tinted blue-grey */
+.ci-row [data-testid="stMetric"] {
+    background: linear-gradient(135deg, #eff6ff 0%, #f0f9ff 100%);
+    border-color: #bfdbfe;
+}
+
+/* Inline stat bar — compact, no-box context line below plots */
+.stat-bar {
+    display: flex; gap: 18px; align-items: center;
+    padding: 6px 0; color: #64748b; font-size: 0.88rem;
+}
+.stat-bar .sv {
+    font-weight: 600; color: #334155;
+}
+
+/* 2P indicator card — subtle warm tint when active */
+.twop-yes [data-testid="stMetric"] {
+    background: linear-gradient(135deg, #fef3c7 0%, #fffbeb 100%);
+    border-color: #fde68a;
+}
+
+/* OE ratio tooltip-style caption */
+.oe-note {
+    font-size: 0.78rem; color: #94a3b8; margin-top: 2px; line-height: 1.3;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -844,11 +870,6 @@ if mode == "Asteroid Viewer":
         hdr += '</div>'
         st.markdown(hdr, unsafe_allow_html=True)
 
-        if prefer_2p and row.get(C_PREFER_2P_R):
-            reason = str(row[C_PREFER_2P_R])
-            if reason and reason != "nan":
-                st.info(f"Pipeline 2P preference: *{reason}*")
-
         # ---- 1. Physical Properties ----
         st.markdown('<p class="section-head">Physical Properties</p>', unsafe_allow_html=True)
         k1, k2, k3, k4 = st.columns(4)
@@ -857,27 +878,42 @@ if mode == "Asteroid Viewer":
         k3.metric("H Mag",              format_float(row.get(C_HMAG), 2))
         k4.metric("Axial Elongation",   format_float(row.get(C_AXIAL), 3))
 
-        # ---- 2. Colour Indices ----
+        # ---- 2. Colour Indices (styled HTML) ----
         st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
-        st.markdown('<p class="section-head">Colour Indices</p>', unsafe_allow_html=True)
-        ci1, ci2, ci3, ci4 = st.columns(4)
-        ci1.metric("g − r", format_float(row.get(C_GR), 4))
-        ci2.metric("g − i", format_float(row.get(C_GI), 4))
-        ci3.metric("r − i", format_float(row.get(C_RI), 4))
-        ci4.metric("Mean Mag", format_float(row.get(C_MEAN_MAG), 3))
+        gr_val  = format_float(row.get(C_GR), 4)
+        gi_val  = format_float(row.get(C_GI), 4)
+        ri_val  = format_float(row.get(C_RI), 4)
+        mm_val  = format_float(row.get(C_MEAN_MAG), 3)
+        st.markdown(f"""
+        <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:10px;">
+          <div style="background:linear-gradient(135deg,#eff6ff,#f0f9ff); border:1px solid #bfdbfe;
+                      border-radius:8px; padding:10px 14px;">
+            <div style="font-size:0.76rem;text-transform:uppercase;letter-spacing:0.04em;color:#3b82f6;font-weight:600;">g − r</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:1.2rem;font-weight:600;color:#1e3a5f;">{gr_val}</div>
+          </div>
+          <div style="background:linear-gradient(135deg,#f0fdf4,#ecfdf5); border:1px solid #86efac;
+                      border-radius:8px; padding:10px 14px;">
+            <div style="font-size:0.76rem;text-transform:uppercase;letter-spacing:0.04em;color:#16a34a;font-weight:600;">g − i</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:1.2rem;font-weight:600;color:#14532d;">{gi_val}</div>
+          </div>
+          <div style="background:linear-gradient(135deg,#fef2f2,#fff1f2); border:1px solid #fca5a5;
+                      border-radius:8px; padding:10px 14px;">
+            <div style="font-size:0.76rem;text-transform:uppercase;letter-spacing:0.04em;color:#dc2626;font-weight:600;">r − i</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:1.2rem;font-weight:600;color:#7f1d1d;">{ri_val}</div>
+          </div>
+          <div style="background:linear-gradient(135deg,#faf5ff,#f5f3ff); border:1px solid #c4b5fd;
+                      border-radius:8px; padding:10px 14px;">
+            <div style="font-size:0.76rem;text-transform:uppercase;letter-spacing:0.04em;color:#7c3aed;font-weight:600;">Mean Mag</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:1.2rem;font-weight:600;color:#3b0764;">{mm_val}</div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
 
         # ---- 3. Rotation Lightcurve (three-panel fold) ----
         if t_hr is not None:
             n_nights = resolve_nights(dfp)
             st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
             st.markdown('<p class="section-head">Rotation Lightcurve</p>', unsafe_allow_html=True)
-
-            st.caption(
-                f"Fold period: **{format_float(P_calc, 6)} h** · "
-                f"{len(dfp):,} obs · "
-                f"{n_nights if n_nights else '—'} nights · "
-                f"**{mag_label}** · bands: {', '.join(sel_bands)}"
-            )
 
             P_half, P_two = 0.5 * P_calc, 2.0 * P_calc
             for col, P_hr, title in zip(
@@ -891,16 +927,25 @@ if mode == "Asteroid Viewer":
                     ax.legend(fontsize=8, loc="upper right", framealpha=0.85)
                     fig.tight_layout(pad=1.0)
                     st.pyplot(fig, clear_figure=True)
+
+            # Inline stat bar — observation context below the plots
+            n_obs  = f"{int(row.get(C_NOBS, 0)):,}" if pd.notna(row.get(C_NOBS)) else "—"
+            arc_d  = format_float(row.get(C_ARC), 2)
+            n_str  = str(n_nights) if n_nights else "—"
+            st.markdown(
+                f'<div class="stat-bar">'
+                f'<span><span class="sv">{n_obs}</span> observations</span>'
+                f'<span>·</span>'
+                f'<span><span class="sv">{arc_d}</span> day arc</span>'
+                f'<span>·</span>'
+                f'<span><span class="sv">{n_str}</span> nights</span>'
+                f'<span>·</span>'
+                f'<span>{mag_label} · bands: {", ".join(sel_bands)}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
         else:
             st.info("No photometry available for this asteroid.")
-
-        # ---- 4. Observations ----
-        st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
-        st.markdown('<p class="section-head">Observations</p>', unsafe_allow_html=True)
-        o1, o2, o3 = st.columns(3)
-        o1.metric("Observations", f"{int(row.get(C_NOBS, 0)):,}" if pd.notna(row.get(C_NOBS)) else "—")
-        o2.metric("Arc (days)",   format_float(row.get(C_ARC), 2))
-        o3.metric("Nights",      "—" if not (t_hr is not None and resolve_nights(dfp)) else str(resolve_nights(dfp)))
 
         # ---- 5. Period Candidates ----
         alt_cands = [c for c in candidates if not c.get("is_adopted")]
@@ -930,13 +975,21 @@ if mode == "Asteroid Viewer":
                     st.session_state["_set_p"] = p
                     st.rerun()
 
-        # ---- 6. 2P Decision (compact) ----
+        # ---- 6. Double-Period (2P) Analysis ----
         st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
-        st.markdown('<p class="section-head">Half-Period / 2P Analysis</p>', unsafe_allow_html=True)
+        st.markdown('<p class="section-head">Double-Period (2P) Analysis</p>', unsafe_allow_html=True)
+        st.caption("The pipeline tests whether the true rotation period is twice the adopted value. "
+                   "A low OE ratio (odd-even amplitude ratio ≲ 0.3) strongly suggests 2P is the physical period.")
+
         b1, b2, b3 = st.columns(3)
         b1.metric("Pipeline prefers 2P", "Yes ✓" if prefer_2p else "No")
         b2.metric("ΔBIC (2P vs P)",      format_float(row.get(C_DBIC_2P), 2))
         b3.metric("OE Ratio",            format_float(row.get(C_OE_RATIO), 3))
+
+        if prefer_2p and row.get(C_PREFER_2P_R):
+            reason = str(row[C_PREFER_2P_R])
+            if reason and reason != "nan":
+                st.info(f"**Reason:** *{reason}*")
 
     # ==================================================================
     # TAB 2 — EVIDENCE
