@@ -619,33 +619,31 @@ if mode == "Asteroid Viewer":
     step = float((hi - lo) / 600.0) if hi > lo else 1e-6
 
     # ------------------------------------------------------------------
-    # CRITICAL: apply any pending reset BEFORE the slider renders.
-    # Writing to a widget key after the widget is drawn raises
-    # StreamlitAPIException. We use a flag instead of writing directly
-    # in the button callback, so the write always happens pre-render.
+    # SLIDER STATE RULES:
+    #   - Streamlit owns fold_period_slider between normal runs.
+    #     We must NOT write to it before rendering — that cancels the
+    #     user's drag. Only write to it when we explicitly want to
+    #     override the position (reset or asteroid switch).
+    #   - fold_period (our shadow copy) is synced FROM the slider
+    #     after it renders.
     # ------------------------------------------------------------------
     if st.session_state.pop("_reset_to_adopted", False):
+        # Clamp P_adopt into slider bounds and snap to step grid
         target = float(np.clip(P_adopt, lo, hi))
         target = round(round((target - lo) / step) * step + lo, 8)
         target = float(np.clip(target, lo, hi))
         st.session_state["fold_period_slider"] = target
-        st.session_state["fold_period"]        = target
-    else:
-        # Clamp stored value into current bounds (bounds may have shifted)
-        current_p = float(st.session_state.get("fold_period", P_adopt))
-        clamped   = float(np.clip(current_p, lo, hi))
-        clamped   = round(round((clamped - lo) / step) * step + lo, 8)
-        clamped   = float(np.clip(clamped, lo, hi))
-        st.session_state["fold_period_slider"] = clamped
-        st.session_state["fold_period"]        = clamped
+        # fold_period will be synced below after slider renders
 
     P_calc = st.sidebar.slider(
         "Fold Period (hours)",
         min_value=float(lo),
         max_value=float(hi),
         step=step,
-        key="fold_period_slider",   # NO value= here — reads from session_state key
+        key="fold_period_slider",
     )
+    # Sync shadow copy after render — this is the only place we write
+    # fold_period from the slider value.
     st.session_state["fold_period"] = float(P_calc)
 
     # Button sets the flag and reruns; the actual key write happens next run
