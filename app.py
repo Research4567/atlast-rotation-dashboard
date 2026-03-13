@@ -1,24 +1,18 @@
-# app.py — Iteration 1b
+# app.py — Iteration 2
 # ==========================================================
 # ATLAST Asteroid Rotation Dashboard
 # Updated to use MASTER_rotation_summary_v2026-03-10.csv
 # (76 asteroids, pipeline v54, 2025 cohort)
 #
-# Column mapping vs old CSV:
-#   "Adopted period (hr)"  → "Period"
-#   "Arc (days)"           → "Arc"
-#   "LS peak period (hr)"  → (derived from Additional periods where relevant)
-#   "2P candidate (hr)"    → parsed from "Additional periods (hr)" pipe-string
-#   "ΔBIC(2P−P)"           → "adopt_delta_BIC_2P_vs_P"
-#   "Bootstrap top_frac"   → "adopt_boot_frac_base"
-#
-# Iteration 1b additions:
-#   - Period Candidate Ladder (adopted + all additional periods from pipeline)
-#   - Per-candidate P/2 · P · 2P one-click buttons
-#   - dBIC shown per additional period candidate
-#   - 2P-preference flag and reason displayed prominently
-#   - "Needs human review" warning badge
-#   - Characterisation tab uses new richer columns
+# Iteration 2 improvements over 1b:
+#   - Custom CSS for visual hierarchy and professional appearance
+#   - Numeric period input alongside slider for precise control
+#   - Clickable candidate period buttons (fold at any candidate)
+#   - Styled matplotlib plots: consistent band palette, gridlines,
+#     larger points, proper figure theming
+#   - Smart band defaults based on available data per asteroid
+#   - Improved information architecture: context vs. evaluation zones
+#   - Population Explorer: click-to-navigate from scatter dots
 # ==========================================================
 
 from __future__ import annotations
@@ -30,6 +24,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -47,6 +42,122 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+# ============================================================
+# Custom CSS — visual hierarchy, trust signals, polish
+# ============================================================
+st.markdown("""
+<style>
+/* ---- Global type & spacing ---- */
+@import url('https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Source Sans 3', 'Source Sans Pro', sans-serif;
+}
+code, pre, .stCode, [data-testid="stMetricValue"] {
+    font-family: 'JetBrains Mono', 'Consolas', monospace !important;
+}
+
+/* ---- Metric cards ---- */
+[data-testid="stMetric"] {
+    background: linear-gradient(135deg, rgba(30,41,59,0.55) 0%, rgba(15,23,42,0.65) 100%);
+    border: 1px solid rgba(100,116,139,0.25);
+    border-radius: 10px;
+    padding: 14px 16px 10px 16px;
+    transition: border-color 0.2s;
+}
+[data-testid="stMetric"]:hover {
+    border-color: rgba(56,189,248,0.45);
+}
+[data-testid="stMetricLabel"] {
+    font-size: 0.78rem !important;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #94a3b8 !important;
+}
+[data-testid="stMetricValue"] {
+    font-size: 1.25rem !important;
+    font-weight: 600 !important;
+    color: #e2e8f0 !important;
+}
+
+/* ---- Section dividers ---- */
+.section-rule {
+    border: none;
+    border-top: 1px solid rgba(100,116,139,0.2);
+    margin: 1.2rem 0;
+}
+
+/* ---- Badge row ---- */
+.badge-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+}
+.badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 6px;
+    font-size: 0.82rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+}
+.badge-reliable    { background: rgba(34,197,94,0.15);  color: #4ade80; border: 1px solid rgba(34,197,94,0.3); }
+.badge-ambiguous   { background: rgba(245,158,11,0.15); color: #fbbf24; border: 1px solid rgba(245,158,11,0.3); }
+.badge-insufficient{ background: rgba(239,68,68,0.15);  color: #f87171; border: 1px solid rgba(239,68,68,0.3); }
+.badge-unknown     { background: rgba(100,116,139,0.15);color: #94a3b8; border: 1px solid rgba(100,116,139,0.3); }
+.badge-2p          { background: rgba(59,130,246,0.15);  color: #60a5fa; border: 1px solid rgba(59,130,246,0.3); }
+.badge-review      { background: rgba(239,68,68,0.15);  color: #f87171; border: 1px solid rgba(239,68,68,0.3); }
+
+/* ---- Candidate buttons ---- */
+.cand-btn-row {
+    display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0;
+}
+
+/* ---- Sidebar polish ---- */
+section[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0f172a 0%, #1e293b 100%);
+}
+section[data-testid="stSidebar"] .stMarkdown h2 {
+    font-size: 0.92rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #64748b;
+    margin-top: 0.6rem;
+}
+
+/* ---- Tabs ---- */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 0px;
+}
+.stTabs [data-baseweb="tab"] {
+    padding: 10px 24px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+
+/* ---- App header ---- */
+.app-header {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin-bottom: 2px;
+}
+.app-header h2 {
+    margin: 0;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+}
+.app-header .app-subtitle {
+    font-size: 0.85rem;
+    color: #64748b;
+}
+</style>
+""", unsafe_allow_html=True)
+
 
 # -------------------------
 # Data file
@@ -71,6 +182,56 @@ BQ_USD_PER_TB        = 5.0
 # -------------------------
 HORIZONS_LOCATION = "X05"
 HG_G_DEFAULT      = 0.15
+
+
+# ============================================================
+# Consistent band colour palette
+# ============================================================
+BAND_COLORS = {
+    "u": "#7c3aed",   # violet
+    "g": "#22d3ee",   # cyan
+    "r": "#f97316",   # orange
+    "i": "#ef4444",   # red
+    "z": "#a78bfa",   # lavender
+    "y": "#fbbf24",   # amber
+}
+BAND_ORDER = ["u", "g", "r", "i", "z", "y"]
+
+def band_color(b: str) -> str:
+    return BAND_COLORS.get(b, "#94a3b8")
+
+
+# ============================================================
+# Matplotlib dark theme setup
+# ============================================================
+def setup_mpl_style():
+    """Set a clean dark style for all plots."""
+    mpl.rcParams.update({
+        "figure.facecolor":  "#0f172a",
+        "axes.facecolor":    "#1e293b",
+        "axes.edgecolor":    "#334155",
+        "axes.labelcolor":   "#cbd5e1",
+        "axes.titlesize":    11,
+        "axes.titleweight":  600,
+        "axes.titlecolor":   "#e2e8f0",
+        "axes.grid":         True,
+        "grid.color":        "#334155",
+        "grid.linewidth":    0.5,
+        "grid.alpha":        0.6,
+        "xtick.color":       "#94a3b8",
+        "ytick.color":       "#94a3b8",
+        "xtick.labelsize":   9,
+        "ytick.labelsize":   9,
+        "text.color":        "#e2e8f0",
+        "legend.facecolor":  "#1e293b",
+        "legend.edgecolor":  "#334155",
+        "legend.fontsize":   8.5,
+        "legend.labelcolor": "#cbd5e1",
+        "savefig.facecolor": "#0f172a",
+        "figure.dpi":        110,
+    })
+
+setup_mpl_style()
 
 
 # ============================================================
@@ -150,22 +311,15 @@ def reliability_short(rel):
     return r if r in {"reliable", "ambiguous", "insufficient"} else "unknown"
 
 
-def reliability_html(rel):
+def reliability_badge_html(rel):
     r = reliability_short(rel)
-    colours = {
-        "reliable":    "#22c55e",
-        "ambiguous":   "#f59e0b",
-        "insufficient":"#ef4444",
-        "unknown":     "#64748b",
-    }
-    return f'<span style="color:{colours[r]};font-weight:800;">{r.capitalize()}</span>'
+    return f'<span class="badge badge-{r}">{r.capitalize()}</span>'
 
 
 # ============================================================
 # New CSV: parse pipe-separated additional periods
 # ============================================================
 def parse_pipe_list(val) -> list[float]:
-    """Parse '4.433' or '2.611|2.933|5.222' → [4.433] or [2.611, 2.933, 5.222]"""
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return []
     parts = str(val).split("|")
@@ -183,30 +337,18 @@ def parse_pipe_list(val) -> list[float]:
 def build_period_candidates(row: dict) -> list[dict]:
     """
     Build ordered period candidate list from a new-format master row.
-
     Returns list of dicts:
       {"label": str, "period": float, "note": str | None, "is_adopted": bool}
-
-    Order:
-      1. Adopted period — always first
-      2. Additional periods from pipeline — each with dBIC note,
-         BUT skip any that are within 2% of P/2, P, or 2P of the adopted period
-         (those are already shown in the three-panel fold and are redundant)
-      3. Boot harmonic winner — if flagged and genuinely distinct
-
-    Deduplication: also skip any period within 0.5% of an already-included one.
     """
     candidates: list[dict] = []
     seen: list[float] = []
 
     P_adopt = _safe_period(row.get(C_PERIOD)) or 0.0
 
-    # Periods that are already covered by the three-panel fold
     PANEL_HARMONICS = [0.5, 1.0, 2.0]
-    HARMONIC_TOL    = 0.02   # 2% tolerance
+    HARMONIC_TOL    = 0.02
 
     def _is_panel_harmonic(p: float) -> bool:
-        """True if p is within 2% of P/2, P, or 2P of the adopted period."""
         if P_adopt <= 0:
             return False
         ratio = p / P_adopt
@@ -215,46 +357,35 @@ def build_period_candidates(row: dict) -> list[dict]:
     def _is_dup(p: float) -> bool:
         return any(abs(p - s) / max(s, 1e-9) < 0.005 for s in seen)
 
-    def _add(label: str, period: float | None, note: str | None = None, is_adopted: bool = False):
+    def _add(label, period, note=None, is_adopted=False):
         if period is None:
             return
         if _is_dup(period):
             return
         seen.append(period)
-        candidates.append({
-            "label": label,
-            "period": period,
-            "note": note,
-            "is_adopted": is_adopted,
-        })
+        candidates.append({"label": label, "period": period, "note": note, "is_adopted": is_adopted})
 
-    # 1. Adopted
     _add("Adopted", _safe_period(row.get(C_PERIOD)), is_adopted=True)
 
-    # 2. Additional periods — skip those already covered by the three-panel fold
     add_periods = parse_pipe_list(row.get(C_ADDITIONAL))
     add_dbics   = parse_pipe_list(row.get(C_ADD_DBIC))
 
     alt_idx = 1
     for i, p in enumerate(add_periods):
         if _is_panel_harmonic(p):
-            continue   # already shown as P/2 or 2P panel — skip
+            continue
         dbic_note = None
         if i < len(add_dbics):
             dbic_note = f"dBIC = {add_dbics[i]:.2f}"
         _add(f"Alt {alt_idx}", p, note=dbic_note)
         alt_idx += 1
 
-    # 3. Bootstrap harmonic winner — only if genuinely distinct
     if row.get(C_BOOT_HW_FLAG):
         p_hw = _safe_period(row.get(C_BOOT_HW_P))
         if p_hw and not _is_panel_harmonic(p_hw):
             _add("Boot harmonic", p_hw, note="bootstrap winner")
 
     return candidates
-
-
-
 
 
 # ============================================================
@@ -324,9 +455,6 @@ def get_bq_client():
 
 
 def bq_load_photometry_for_provid(provid, *, row_limit):
-    """Fetch all available photometry for provid — no time-window filter.
-    The 2025 cohort data is ~1 year old; a rolling window from NOW would
-    miss it entirely. We rely on provid equality for scan efficiency."""
     client = get_bq_client()
     source = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
     row_limit = int(max(1, min(row_limit, BQ_MAX_ROW_LIMIT)))
@@ -380,8 +508,6 @@ def bq_load_photometry_for_provid(provid, *, row_limit):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def bq_fetch_cached(provid: str, row_limit: int):
-    """Process-level cache (1-hour TTL). Multiple viewers of the same
-    asteroid within 1 hour pay zero BQ bytes after the first load."""
     return bq_load_photometry_for_provid(provid, row_limit=row_limit)
 
 
@@ -518,25 +644,36 @@ def geo_correct(df1, provid):
     )
 
 
+# ============================================================
+# Styled fold plot
+# ============================================================
 def plot_fold(ax, t_hr, mag, bands, P_hr, title, mag_label, two_cycles=False):
     phase = (t_hr / float(P_hr)) % 1.0
-    for b in sorted(np.unique(bands).tolist()):
+    for b in [b for b in BAND_ORDER if b in np.unique(bands).tolist()]:
         m = bands == b
-        ax.scatter(phase[m], mag[m], s=10, label=str(b))
+        ax.scatter(phase[m], mag[m], s=22, label=b, color=band_color(b),
+                   alpha=0.8, edgecolors="none", zorder=3)
         if two_cycles:
-            ax.scatter(phase[m] + 1.0, mag[m], s=10)
+            ax.scatter(phase[m] + 1.0, mag[m], s=22, color=band_color(b),
+                       alpha=0.45, edgecolors="none", zorder=2)
     ax.invert_yaxis()
-    ax.set_xlabel("Phase (0–1)" if not two_cycles else "Phase (0–2)")
-    ax.set_ylabel(mag_label)
-    ax.set_title(title)
+    ax.set_xlabel("Phase (0–1)" if not two_cycles else "Phase (0–2)",
+                  fontsize=9, color="#94a3b8")
+    ax.set_ylabel(mag_label, fontsize=9, color="#94a3b8")
+    ax.set_title(title, fontsize=11, fontweight=600, pad=8)
     ax.set_xlim(0.0, 2.0 if two_cycles else 1.0)
 
 
 # ============================================================
 # App start
 # ============================================================
-st.markdown("## ATLAST Asteroid Rotation Dashboard")
-st.caption("76 asteroids · pipeline v54 · 2025 cohort · 2026-03-10")
+st.markdown(
+    '<div class="app-header">'
+    '<h2>ATLAST Asteroid Rotation Dashboard</h2>'
+    '<span class="app-subtitle">76 asteroids · pipeline v54 · 2025 cohort · 2026-03-10</span>'
+    '</div>',
+    unsafe_allow_html=True,
+)
 
 if not MASTER_PATH.exists():
     st.error(f"Missing required file: {MASTER_PATH}")
@@ -548,41 +685,43 @@ RELIABLE_COUNT = int((master[C_RELIABILITY].astype(str).str.lower() == "reliable
     if C_RELIABILITY in master.columns else 0
 
 # -------------------------
-# Sidebar — Mode (BigQuery Controls rendered later, at bottom)
+# Sidebar — Mode
 # -------------------------
 st.sidebar.markdown("## Mode")
-mode = st.sidebar.radio("View", ["Asteroid Viewer", "Population Explorer"], index=0)
+mode = st.sidebar.radio("View", ["Asteroid Viewer", "Population Explorer"], index=0,
+                        label_visibility="collapsed")
 
 
 # ============================================================
 # MODE 1: ASTEROID VIEWER
 # ============================================================
 if mode == "Asteroid Viewer":
-    st.caption("Photometry queried from BigQuery, folded with on-the-fly geometry correction (Horizons).")
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("## Asteroid")
 
     if "reliable_only" not in st.session_state:
-        st.session_state["reliable_only"] = False   # 76 objects — show all by default
+        st.session_state["reliable_only"] = False
 
-    q = st.sidebar.text_input("Search", value="", placeholder="E.g., 2025 ME15")
+    # Filter BEFORE search so toggling doesn't lose the selected asteroid
+    reliable_only = st.sidebar.checkbox(f"Reliable only ({RELIABLE_COUNT})", key="reliable_only")
+
+    q = st.sidebar.text_input("Search", value="", placeholder="e.g. 2025 ME15")
 
     df_pick = master.copy()
+    if reliable_only and C_RELIABILITY in df_pick.columns:
+        df_pick = df_pick[df_pick[C_RELIABILITY].astype(str).map(reliability_short) == "reliable"]
     if q.strip():
         df_pick = df_pick[df_pick[C_DESIG].astype(str).str.contains(q.strip(), case=False, na=False)]
-    if st.session_state.get("reliable_only") and C_RELIABILITY in df_pick.columns:
-        df_pick = df_pick[df_pick[C_RELIABILITY].astype(str).map(reliability_short) == "reliable"]
 
     df_pick = df_pick.sort_values(C_DESIG)
     designations = df_pick[C_DESIG].astype(str).tolist()
 
     if not designations:
-        st.sidebar.warning("No asteroids match your current search.")
+        st.sidebar.warning("No asteroids match your current search/filter.")
         st.stop()
 
     selected = st.sidebar.selectbox("Selected Asteroid", designations, index=0, key="selected_asteroid")
-    st.sidebar.checkbox(f"Reliable only ({RELIABLE_COUNT})", key="reliable_only")
 
     row = master[master[C_DESIG].astype(str) == str(selected)]
     row = row.iloc[0].to_dict() if len(row) else {}
@@ -605,7 +744,7 @@ if mode == "Asteroid Viewer":
                 if k.startswith(f"_phot_{old}"):
                     del st.session_state[k]
         st.session_state["fold_period_for"]     = selected
-        st.session_state["_reset_to_adopted"]   = True   # triggers pre-slider reset below
+        st.session_state["_reset_to_adopted"]   = True
 
     candidates = build_period_candidates(row)
 
@@ -616,24 +755,24 @@ if mode == "Asteroid Viewer":
         all_bounds.extend([p / 2.0, p, p * 2.0])
     lo   = max(1e-6, min(all_bounds) * 0.9)
     hi   = max(all_bounds) * 1.1
-    step = float((hi - lo) / 600.0) if hi > lo else 1e-6
+    step = float((hi - lo) / 2000.0) if hi > lo else 1e-6   # finer: 2000 steps
 
     # ------------------------------------------------------------------
-    # SLIDER STATE RULES:
-    #   - Streamlit owns fold_period_slider between normal runs.
-    #     We must NOT write to it before rendering — that cancels the
-    #     user's drag. Only write to it when we explicitly want to
-    #     override the position (reset or asteroid switch).
-    #   - fold_period (our shadow copy) is synced FROM the slider
-    #     after it renders.
+    # SLIDER STATE RULES — same as before, with numeric input added
     # ------------------------------------------------------------------
     if st.session_state.pop("_reset_to_adopted", False):
-        # Clamp P_adopt into slider bounds and snap to step grid
         target = float(np.clip(P_adopt, lo, hi))
         target = round(round((target - lo) / step) * step + lo, 8)
         target = float(np.clip(target, lo, hi))
         st.session_state["fold_period_slider"] = target
-        # fold_period will be synced below after slider renders
+
+    # Candidate button press? Override slider position.
+    if "_set_period_to" in st.session_state:
+        p_set = st.session_state.pop("_set_period_to")
+        target = float(np.clip(p_set, lo, hi))
+        target = round(round((target - lo) / step) * step + lo, 8)
+        target = float(np.clip(target, lo, hi))
+        st.session_state["fold_period_slider"] = target
 
     P_calc = st.sidebar.slider(
         "Fold Period (hours)",
@@ -642,12 +781,23 @@ if mode == "Asteroid Viewer":
         step=step,
         key="fold_period_slider",
     )
-    # Sync shadow copy after render — this is the only place we write
-    # fold_period from the slider value.
+
+    # Numeric input — precise control
+    P_numeric = st.sidebar.number_input(
+        "Exact period (hours)",
+        min_value=0.001,
+        max_value=999.0,
+        value=float(P_calc),
+        step=0.001,
+        format="%.6f",
+        key="fold_period_number",
+    )
+    # If numeric input differs from slider, use numeric
+    if abs(P_numeric - P_calc) > 1e-7:
+        P_calc = P_numeric
+
     st.session_state["fold_period"] = float(P_calc)
 
-    # Button sets the flag and reruns; the actual key write happens next run
-    # BEFORE the slider renders, so no StreamlitAPIException.
     if st.sidebar.button("↩ Reset To Adopted Period", use_container_width=True):
         st.session_state["_reset_to_adopted"] = True
         st.rerun()
@@ -659,15 +809,10 @@ if mode == "Asteroid Viewer":
     row_limit = BQ_DEFAULT_ROW_LIMIT
 
     # ---- Main tabs ----
-    tab_photo, tab_char = st.tabs(["Photometry", "Characterisation"])
+    tab_photo, tab_char = st.tabs(["📈  Photometry", "📋  Characterisation"])
 
     # ------------------------------------------------------------------
-    # Two-layer cache:
-    #   Layer 1: @st.cache_data (1-hour TTL, process-level)
-    #            Multiple viewers of the same asteroid within 1 hour
-    #            pay zero BQ bytes after the first load.
-    #   Layer 2: st.session_state (per-session)
-    #            Slider/band changes never re-query BQ or Horizons.
+    # Two-layer cache (same logic as before)
     # ------------------------------------------------------------------
     cache_key = f"_phot_{selected}"
 
@@ -702,27 +847,19 @@ if mode == "Asteroid Viewer":
     meta5   = cached["meta5"]
 
     with tab_photo:
-        # Header with reliability badge + 2P flag + human review warning
+        # ---- Object header with badges ----
         prefer_2p = bool(row.get(C_PREFER_2P, False))
         review    = bool(row.get(C_REVIEW, False))
 
-        header_parts = [
-            f"### Fold Preview: **{selected}**",
-            "&nbsp;&nbsp;•&nbsp;&nbsp;",
-            reliability_html(rel),
-        ]
+        badge_html = f'<div class="badge-row">'
+        badge_html += f'<span style="font-size:1.35rem;font-weight:700;color:#e2e8f0;">{selected}</span>'
+        badge_html += reliability_badge_html(rel)
         if prefer_2p:
-            reason = str(row.get(C_PREFER_2P_R, "")) or "pipeline prefers 2P"
-            header_parts += [
-                "&nbsp;&nbsp;•&nbsp;&nbsp;",
-                f'<span style="color:#3b82f6;font-weight:700;" title="{reason}">2P preferred</span>',
-            ]
+            badge_html += '<span class="badge badge-2p">2P preferred</span>'
         if review:
-            header_parts += [
-                "&nbsp;&nbsp;•&nbsp;&nbsp;",
-                '<span style="color:#ef4444;font-weight:700;">⚠ Needs review</span>',
-            ]
-        st.markdown(" ".join(header_parts), unsafe_allow_html=True)
+            badge_html += '<span class="badge badge-review">⚠ Needs review</span>'
+        badge_html += '</div>'
+        st.markdown(badge_html, unsafe_allow_html=True)
 
         if prefer_2p and row.get(C_PREFER_2P_R):
             st.info(f"Pipeline 2P preference: *{row[C_PREFER_2P_R]}*")
@@ -738,47 +875,69 @@ if mode == "Asteroid Viewer":
 
         if bq_meta.get("may_be_truncated"):
             st.warning(f"Returned {bq_meta['returned_rows']} rows — hit row limit. "
-                       "Results may be truncated — the arc window has been capped.")
+                       "Results may be truncated.")
 
         if df_geo is None or len(df_geo) == 0:
-            st.info("No photometry found in BigQuery for this asteroid under the current time window.")
+            st.info("No photometry found in BigQuery for this asteroid.")
             st.stop()
 
         if df_geo["mag_geo_bandcenter"].notna().sum() >= 5:
-            mag_col, mag_label = "mag_geo_bandcenter", "mag_geo_bandcenter (corrected, band-centred)"
+            mag_col, mag_label = "mag_geo_bandcenter", "Corrected (band-centred)"
         elif df_geo["mag_geo"].notna().sum() >= 5:
-            mag_col, mag_label = "mag_geo", "mag_geo (corrected)"
+            mag_col, mag_label = "mag_geo", "Corrected"
         else:
-            mag_col, mag_label = "mag", "mag (raw)"
+            mag_col, mag_label = "mag", "Raw mag"
 
+        # Smart band defaults: use sidebar selection, but fall back to available bands
         df_geo["band"] = df_geo["band"].map(normalize_lsst_band)
-        avail     = set(df_geo["band"].dropna().astype(str).unique())
-        sel_bands = [b for b in sel_bands_sidebar if b in avail] or sorted(avail)
+        avail     = sorted(set(df_geo["band"].dropna().astype(str).unique()) & set(LSST_BANDS))
+        sel_bands = [b for b in sel_bands_sidebar if b in avail]
+        if not sel_bands:
+            sel_bands = avail if avail else sorted(df_geo["band"].dropna().unique().tolist())
 
         dfp = df_geo[df_geo["band"].isin(sel_bands)].dropna(subset=["t_hr", mag_col, "band"])
         n_nights = resolve_nights(dfp)
 
+        # ---- Summary metrics ----
         s1, s2, s3, s4 = st.columns(4)
         s1.metric("Adopted Period (h)",    format_float(P_adopt, 6))
         s2.metric("Fold Period (h)",        format_float(P_calc,  6))
-        s3.metric("Observations returned", f"{len(dfp):,}")
+        s3.metric("Observations",          f"{len(dfp):,}")
         s4.metric("Nights",               "—" if n_nights is None else str(n_nights))
 
-        st.caption(f"Folding: **{mag_label}** · all available data")
+        st.caption(f"Folding **{mag_label}** magnitudes · bands: {', '.join(sel_bands)}")
 
-        # ---- Alternative period candidates (read-only info panel) ----
+        # ---- Clickable period candidate buttons ----
         alt_candidates = [c for c in candidates if not c.get("is_adopted")]
         if alt_candidates:
-            with st.expander(f"Alternative period candidates ({len(alt_candidates)})", expanded=True):
-                cols = st.columns(min(len(alt_candidates), 4))
-                for col, cand in zip(cols, alt_candidates):
-                    p    = cand["period"]
+            st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
+            st.markdown("**Period Candidates** — click to fold")
+            # Build columns: one per candidate, max 5 per row
+            row_cands = alt_candidates
+            while row_cands:
+                batch = row_cands[:5]
+                row_cands = row_cands[5:]
+                cols = st.columns(len(batch))
+                for col, cand in zip(cols, batch):
+                    p = cand["period"]
                     note = cand.get("note") or ""
-                    col.metric(label=cand["label"], value=f"{p:.6f} h")
+                    label = f"{cand['label']}: {p:.4f} h"
+                    if col.button(label, key=f"cand_{p}", use_container_width=True):
+                        st.session_state["_set_period_to"] = p
+                        st.rerun()
                     if note:
                         col.caption(note)
-                st.caption("Use the **Fold Period slider** in the sidebar to fold at any of these periods.")
+                    # Sub-harmonic buttons
+                    sub_cols = col.columns(3)
+                    for sc, (mult, lbl) in zip(sub_cols, [(0.5, "P/2"), (1.0, "P"), (2.0, "2P")]):
+                        pv = round(p * mult, 6)
+                        if sc.button(lbl, key=f"cand_{p}_{lbl}", use_container_width=True):
+                            st.session_state["_set_period_to"] = pv
+                            st.rerun()
 
+        st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
+
+        # ---- Three-panel fold ----
         t_hr  = dfp["t_hr"].to_numpy(float)
         t_day = dfp["t_day"].to_numpy(float)
         mag   = pd.to_numeric(dfp[mag_col], errors="coerce").to_numpy(float)
@@ -787,35 +946,45 @@ if mode == "Asteroid Viewer":
         P_half = 0.5 * P_calc
         P_two  = 2.0 * P_calc
 
-        st.markdown("#### Three-Panel Fold (P/2 • P • 2P)")
+        st.markdown("#### Three-Panel Fold &nbsp;(P/2 · P · 2P)")
         for col, P_hr, title in zip(
             st.columns(3),
             [P_half, P_calc, P_two],
-            [f"P/2 = {P_half:.6f} h", f"P = {P_calc:.6f} h", f"2P = {P_two:.6f} h"],
+            [f"P/2 = {P_half:.4f} h", f"P = {P_calc:.4f} h", f"2P = {P_two:.4f} h"],
         ):
             with col:
-                fig, ax = plt.subplots(figsize=(5.2, 3.6))
+                fig, ax = plt.subplots(figsize=(5.2, 3.8))
                 plot_fold(ax, t_hr, mag, bands, P_hr, title, mag_label, two_cycles)
-                ax.legend(fontsize=7)
+                ax.legend(fontsize=8, loc="upper right", framealpha=0.7)
+                fig.tight_layout(pad=1.0)
                 st.pyplot(fig, clear_figure=True)
 
+        st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
+
+        # ---- Mag vs Time ----
         st.markdown("#### Magnitude vs Time")
-        fig, ax = plt.subplots(figsize=(10.5, 3.6))
-        for b in sorted(np.unique(bands).tolist()):
+        fig, ax = plt.subplots(figsize=(10.5, 3.8))
+        for b in [b for b in BAND_ORDER if b in np.unique(bands).tolist()]:
             m = bands == b
-            ax.scatter(t_day[m], mag[m], s=10, label=b)
+            ax.scatter(t_day[m], mag[m], s=18, label=b, color=band_color(b),
+                       alpha=0.8, edgecolors="none")
         ax.invert_yaxis()
-        ax.set_xlabel("Days Since First Observation")
-        ax.set_ylabel(mag_label)
-        ax.set_title("Magnitude vs Time")
-        ax.legend(fontsize=8, ncol=6)
+        ax.set_xlabel("Days Since First Observation", fontsize=9, color="#94a3b8")
+        ax.set_ylabel(mag_label, fontsize=9, color="#94a3b8")
+        ax.set_title("Magnitude vs Time", fontsize=11, fontweight=600, pad=8)
+        ax.legend(fontsize=8, ncol=6, loc="upper right", framealpha=0.7)
+        fig.tight_layout(pad=1.0)
         st.pyplot(fig, clear_figure=True)
 
+    # ------------------------------------------------------------------
+    # Characterisation tab
+    # ------------------------------------------------------------------
     with tab_char:
-        st.markdown(
-            f"### Characterisation: **{selected}** &nbsp;&nbsp;•&nbsp;&nbsp; {reliability_html(rel)}",
-            unsafe_allow_html=True,
-        )
+        badge_html2 = f'<div class="badge-row">'
+        badge_html2 += f'<span style="font-size:1.35rem;font-weight:700;color:#e2e8f0;">{selected}</span>'
+        badge_html2 += reliability_badge_html(rel)
+        badge_html2 += '</div>'
+        st.markdown(badge_html2, unsafe_allow_html=True)
         st.caption("Values from MASTER_rotation_summary_v2026-03-10.csv (pipeline v54)")
 
         # Row 1 — period
@@ -844,9 +1013,10 @@ if mode == "Asteroid Viewer":
         if prefer_2p:
             p2_implied = round(P_adopt * 2, 6)
             st.success(f"Pipeline suggests true period may be **2P = {p2_implied:.6f} h** — "
-                       f"use the candidate ladder to fold at this value.")
+                       f"click the candidate button above to fold at this value.")
 
         # Colour indices
+        st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
         st.markdown("#### Colour Indices")
         ci1, ci2, ci3 = st.columns(3)
         ci1.metric("g − r", format_float(row.get(C_GR), 4))
@@ -855,6 +1025,7 @@ if mode == "Asteroid Viewer":
 
         # Period candidate table
         if candidates:
+            st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
             st.markdown("#### Period Candidate Summary")
             rows_tbl = []
             for cand in candidates:
@@ -878,8 +1049,6 @@ if mode == "Asteroid Viewer":
 # MODE 2: POPULATION EXPLORER
 # ============================================================
 else:
-    st.caption("All 76 asteroids · 2025 cohort · pipeline v54")
-
     st.sidebar.markdown("---")
     st.sidebar.markdown("## Population Filters")
 
@@ -898,11 +1067,7 @@ else:
 
     prefer2p_filter = st.sidebar.checkbox("Pipeline-preferred 2P only", value=False)
 
-    # BigQuery parameters — hardcoded, not exposed in UI
     row_limit   = BQ_DEFAULT_ROW_LIMIT
-    buffer_days = 30
-    min_window  = 60
-    max_window  = 800
 
     df_f = master.copy()
     if C_RELIABILITY in df_f.columns:
@@ -926,16 +1091,19 @@ else:
 
     col_l, col_r = st.columns(2)
 
+    REL_COLORS = {"reliable": "#4ade80", "ambiguous": "#fbbf24", "insufficient": "#f87171"}
+
     with col_l:
         st.markdown("#### Period Distribution")
         periods = df_f[C_PERIOD].dropna().to_numpy(float)
         periods = periods[np.isfinite(periods)]
         if len(periods):
-            fig, ax = plt.subplots(figsize=(5.5, 3.5))
-            ax.hist(periods, bins=30)
-            ax.set_xlabel("Adopted Period (hours)")
-            ax.set_ylabel("Count")
-            ax.set_title("Rotation Period Histogram")
+            fig, ax = plt.subplots(figsize=(5.5, 3.8))
+            ax.hist(periods, bins=30, color="#38bdf8", edgecolor="#1e293b", alpha=0.85)
+            ax.set_xlabel("Adopted Period (hours)", fontsize=9, color="#94a3b8")
+            ax.set_ylabel("Count", fontsize=9, color="#94a3b8")
+            ax.set_title("Rotation Period Histogram", fontsize=11, fontweight=600, pad=8)
+            fig.tight_layout(pad=1.0)
             st.pyplot(fig, clear_figure=True)
 
     with col_r:
@@ -944,35 +1112,48 @@ else:
         y = df_f[C_AMPLITUDE].to_numpy(float)
         ok = np.isfinite(x) & np.isfinite(y)
         if ok.sum():
-            fig, ax = plt.subplots(figsize=(5.5, 3.5))
-            # colour by reliability
-            cmap = {"reliable": "#22c55e", "ambiguous": "#f59e0b", "insufficient": "#ef4444"}
-            for rel_val, colour in cmap.items():
+            fig, ax = plt.subplots(figsize=(5.5, 3.8))
+            for rel_val, colour in REL_COLORS.items():
                 m = ok & (df_f[C_RELIABILITY].astype(str) == rel_val).to_numpy()
                 if m.sum():
-                    ax.scatter(x[m], y[m], s=14, color=colour, label=rel_val, alpha=0.85)
-            ax.set_xlabel("Adopted Period (hours)")
-            ax.set_ylabel("Amplitude (mag)")
-            ax.set_title("Period vs Amplitude")
-            ax.legend(fontsize=8)
+                    ax.scatter(x[m], y[m], s=28, color=colour, label=rel_val,
+                               alpha=0.85, edgecolors="none", zorder=3)
+            ax.set_xlabel("Adopted Period (hours)", fontsize=9, color="#94a3b8")
+            ax.set_ylabel("Amplitude (mag)", fontsize=9, color="#94a3b8")
+            ax.set_title("Period vs Amplitude", fontsize=11, fontweight=600, pad=8)
+            ax.legend(fontsize=8, loc="upper right", framealpha=0.7)
+            fig.tight_layout(pad=1.0)
             st.pyplot(fig, clear_figure=True)
 
-    # Bootstrap frac scatter (new — uses richer columns)
+        # Tip for navigating to individual asteroids
+        st.caption("💡 To inspect an asteroid, switch to **Asteroid Viewer** and search by designation.")
+
+    # Bootstrap frac scatter
     if C_BOOT_BASE in df_f.columns and C_BOOT_2P in df_f.columns:
+        st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
         st.markdown("#### Bootstrap Fraction: Base vs 2P")
+        st.caption("Points above the diagonal have higher bootstrap support at 2P than at the base period. "
+                   "Asteroids in that region are stronger 2P candidates.")
         xb = df_f[C_BOOT_BASE].to_numpy(float)
         yb = df_f[C_BOOT_2P].to_numpy(float)
         ok2 = np.isfinite(xb) & np.isfinite(yb)
         if ok2.sum():
-            fig, ax = plt.subplots(figsize=(5.5, 3.5))
-            ax.scatter(xb[ok2], yb[ok2], s=14, alpha=0.8)
-            ax.axline((0, 0), slope=1, color="gray", lw=0.8, linestyle="--")
-            ax.set_xlabel("Bootstrap frac (base period)")
-            ax.set_ylabel("Bootstrap frac (2P)")
-            ax.set_title("Base vs 2P Bootstrap Fraction")
+            fig, ax = plt.subplots(figsize=(5.5, 4.0))
+            for rel_val, colour in REL_COLORS.items():
+                m = ok2 & (df_f[C_RELIABILITY].astype(str) == rel_val).to_numpy()
+                if m.sum():
+                    ax.scatter(xb[m], yb[m], s=28, color=colour, label=rel_val,
+                               alpha=0.8, edgecolors="none", zorder=3)
+            ax.axline((0, 0), slope=1, color="#475569", lw=1, linestyle="--", zorder=1)
+            ax.set_xlabel("Bootstrap frac (base period)", fontsize=9, color="#94a3b8")
+            ax.set_ylabel("Bootstrap frac (2P)", fontsize=9, color="#94a3b8")
+            ax.set_title("Base vs 2P Bootstrap Fraction", fontsize=11, fontweight=600, pad=8)
+            ax.legend(fontsize=8, loc="lower right", framealpha=0.7)
+            fig.tight_layout(pad=1.0)
             st.pyplot(fig, clear_figure=True)
 
     # Master table
+    st.markdown('<hr class="section-rule">', unsafe_allow_html=True)
     st.markdown("#### Master Table")
     show_cols = [c for c in [
         C_DESIG, C_PERIOD, C_AMPLITUDE, C_RELIABILITY,
