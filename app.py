@@ -883,9 +883,8 @@ if mode == "Asteroid Viewer":
         gr_val  = format_float(row.get(C_GR), 4)
         gi_val  = format_float(row.get(C_GI), 4)
         ri_val  = format_float(row.get(C_RI), 4)
-        mm_val  = format_float(row.get(C_MEAN_MAG), 3)
         st.markdown(f"""
-        <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:10px;">
+        <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:10px;">
           <div style="background:linear-gradient(135deg,#eff6ff,#f0f9ff); border:1px solid #bfdbfe;
                       border-radius:8px; padding:10px 14px;">
             <div style="font-size:0.76rem;text-transform:uppercase;letter-spacing:0.04em;color:#3b82f6;font-weight:600;">g − r</div>
@@ -900,11 +899,6 @@ if mode == "Asteroid Viewer":
                       border-radius:8px; padding:10px 14px;">
             <div style="font-size:0.76rem;text-transform:uppercase;letter-spacing:0.04em;color:#dc2626;font-weight:600;">r − i</div>
             <div style="font-family:'JetBrains Mono',monospace;font-size:1.2rem;font-weight:600;color:#7f1d1d;">{ri_val}</div>
-          </div>
-          <div style="background:linear-gradient(135deg,#faf5ff,#f5f3ff); border:1px solid #c4b5fd;
-                      border-radius:8px; padding:10px 14px;">
-            <div style="font-size:0.76rem;text-transform:uppercase;letter-spacing:0.04em;color:#7c3aed;font-weight:600;">Mean Mag</div>
-            <div style="font-family:'JetBrains Mono',monospace;font-size:1.2rem;font-weight:600;color:#3b0764;">{mm_val}</div>
           </div>
         </div>
         """, unsafe_allow_html=True)
@@ -932,6 +926,7 @@ if mode == "Asteroid Viewer":
             n_obs  = f"{int(row.get(C_NOBS, 0)):,}" if pd.notna(row.get(C_NOBS)) else "—"
             arc_d  = format_float(row.get(C_ARC), 2)
             n_str  = str(n_nights) if n_nights else "—"
+            m_mag  = format_float(row.get(C_MEAN_MAG), 2)
             st.markdown(
                 f'<div class="stat-bar">'
                 f'<span><span class="sv">{n_obs}</span> observations</span>'
@@ -939,6 +934,8 @@ if mode == "Asteroid Viewer":
                 f'<span><span class="sv">{arc_d}</span> day arc</span>'
                 f'<span>·</span>'
                 f'<span><span class="sv">{n_str}</span> nights</span>'
+                f'<span>·</span>'
+                f'<span>mean mag <span class="sv">{m_mag}</span></span>'
                 f'<span>·</span>'
                 f'<span>{mag_label} · bands: {", ".join(sel_bands)}</span>'
                 f'</div>',
